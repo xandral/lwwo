@@ -1,0 +1,12 @@
+[package]
+name = "lwwo-core"
+description = "Decision core of lwwo: pure logic, no I/O"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+# No dependencies: adding one is a design decision (see the spec, "La guardia sul core").
+[dependencies]

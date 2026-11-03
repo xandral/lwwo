@@ -1,0 +1,11 @@
+# The core never reads the clock or does I/O: time and data are inputs.
+disallowed-methods = [
+  { path = "std::time::SystemTime::now", reason = "the core receives the current time as input" },
+  { path = "std::time::Instant::now", reason = "the core receives the current time as input" },
+  { path = "std::thread::spawn", reason = "the core does not spawn threads" },
+  { path = "std::env::var", reason = "the core does not read the environment" },
+]
+disallowed-types = [
+  { path = "std::fs::File", reason = "the core does no I/O" },
+  { path = "std::net::TcpStream", reason = "the core does no I/O" },
+]
