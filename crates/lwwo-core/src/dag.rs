@@ -15,6 +15,7 @@
 use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::fmt;
+use std::time::Duration;
 
 /// Position of a task within its DAG version: 0, 1, 2… in DAG order.
 ///
@@ -46,13 +47,93 @@ impl TaskId {
     }
 }
 
-/// A task as written in the DAG: its name and the names it depends on.
+/// A task as written in the DAG: its name, the names it depends on, and
+/// how it is placed and retried.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaskDef {
     /// Unique name of the task within the DAG.
     pub name: String,
     /// Names of the tasks that must succeed before this one starts.
     pub needs: Vec<String>,
+    /// Placement, retries and timeout.
+    pub options: TaskOptions,
+}
+
+/// What the core needs to know about a task besides its dependencies.
+///
+/// What the task runs (command, image, environment…) stays in the binary:
+/// the core only places it on a worker and decides on retries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskOptions {
+    /// Slots the task takes on its worker; at least 1.
+    pub slots: u32,
+    /// Labels the worker must have.
+    pub labels: Vec<String>,
+    /// Extra attempts after a failure.
+    pub retries: u32,
+    /// Wait before the first retry.
+    pub retry_delay: Duration,
+    /// How the wait grows from one retry to the next.
+    pub retry_backoff: Backoff,
+    /// The longest wait between two attempts; `None` for no cap.
+    pub max_retry_delay: Option<Duration>,
+    /// Longest an attempt may run, enforced by the worker; `None` for no
+    /// limit.
+    pub timeout: Option<Duration>,
+}
+
+impl Default for TaskOptions {
+    /// One slot, no labels, no retries, a 30 second retry delay doubling
+    /// with no cap, and no timeout, as in the spec.
+    fn default() -> Self {
+        Self {
+            slots: 1,
+            labels: Vec::new(),
+            retries: 0,
+            retry_delay: Duration::from_secs(30),
+            retry_backoff: Backoff::Exponential,
+            max_retry_delay: None,
+            timeout: None,
+        }
+    }
+}
+
+impl TaskOptions {
+    /// How long to wait after attempt `failed` (from 1) fails, before the
+    /// next one, capped at `max_retry_delay`.
+    ///
+    /// ```text
+    /// retry_delay 30s, exponential:  after 1 → 30s,  2 → 60s,  3 → 120s
+    /// retry_delay 30s, fixed:        after 1 → 30s,  2 → 30s,  3 → 30s
+    /// exponential, max 1m:           after 1 → 30s,  2 → 60s,  3 → 60s
+    /// ```
+    ///
+    /// The exponential wait saturates at [`Duration::MAX`] instead of
+    /// overflowing.
+    #[must_use]
+    pub fn retry_delay_after(&self, failed: u32) -> Duration {
+        let delay = match self.retry_backoff {
+            Backoff::Fixed => self.retry_delay,
+            Backoff::Exponential => 2u32
+                .checked_pow(failed.saturating_sub(1))
+                .and_then(|factor| self.retry_delay.checked_mul(factor))
+                .unwrap_or(Duration::MAX),
+        };
+        match self.max_retry_delay {
+            Some(max) => delay.min(max),
+            None => delay,
+        }
+    }
+}
+
+/// How the wait between attempts grows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Backoff {
+    /// It doubles at each retry.
+    #[default]
+    Exponential,
+    /// It stays `retry_delay`.
+    Fixed,
 }
 
 /// Why a DAG was rejected.
@@ -78,6 +159,8 @@ pub enum DagError {
     },
     /// Tasks that are part of a cycle or depend on one, in DAG order.
     Cycle(Vec<String>),
+    /// A task asks for zero slots, so it would never use up a worker.
+    ZeroSlots(String),
 }
 
 impl fmt::Display for DagError {
@@ -94,6 +177,7 @@ impl fmt::Display for DagError {
             Self::Cycle(tasks) => {
                 write!(f, "tasks in or after a cycle: {}", tasks.join(", "))
             }
+            Self::ZeroSlots(name) => write!(f, "task `{name}` needs at least 1 slot"),
         }
     }
 }
@@ -104,6 +188,7 @@ impl Error for DagError {}
 #[derive(Debug, Clone)]
 pub struct Graph {
     names: Vec<String>,
+    options: Vec<TaskOptions>,
     succ: Vec<TaskId>,
     start: Vec<usize>,
     in_degree: Vec<usize>,
@@ -115,8 +200,9 @@ impl Graph {
     /// # Errors
     ///
     /// Returns a [`DagError`] if the DAG has too many tasks, if two tasks
-    /// share a name, if a task lists the same dependency twice or a name
-    /// that does not exist, or if the dependencies contain a cycle.
+    /// share a name, if a task asks for zero slots, if a task lists the
+    /// same dependency twice or a name that does not exist, or if the
+    /// dependencies contain a cycle.
     pub fn build(tasks: &[TaskDef]) -> Result<Self, DagError> {
         if u32::try_from(tasks.len()).is_err() {
             return Err(DagError::TooManyTasks(tasks.len()));
@@ -128,6 +214,10 @@ impl Graph {
             if ids.insert(&task.name, TaskId::from_index(i)).is_some() {
                 return Err(DagError::DuplicateTask(task.name.clone()));
             }
+        }
+
+        if let Some(task) = tasks.iter().find(|task| task.options.slots == 0) {
+            return Err(DagError::ZeroSlots(task.name.clone()));
         }
 
         // Each dependency at most once per task: a repeat is almost always a typo.
@@ -165,6 +255,7 @@ impl Graph {
         let (start, succ) = successors_csr(&preds);
         let graph = Self {
             names: tasks.iter().map(|t| t.name.clone()).collect(),
+            options: tasks.iter().map(|t| t.options.clone()).collect(),
             succ,
             start,
             in_degree: in_degrees(&preds),
@@ -206,6 +297,16 @@ impl Graph {
     #[must_use]
     pub fn name(&self, t: TaskId) -> &str {
         &self.names[t.index()]
+    }
+
+    /// Placement, retries and timeout of task `t`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `t` does not belong to this graph.
+    #[must_use]
+    pub fn options(&self, t: TaskId) -> &TaskOptions {
+        &self.options[t.index()]
     }
 
     /// Number of dependencies of each task, indexed by [`TaskId::index`].
@@ -302,6 +403,7 @@ mod tests {
         TaskDef {
             name: name.to_owned(),
             needs: needs.iter().map(|&n| n.to_owned()).collect(),
+            options: TaskOptions::default(),
         }
     }
 
@@ -331,6 +433,7 @@ mod tests {
     fn successors_of_example() {
         let g = Graph {
             names: ["a", "b", "c", "d"].map(String::from).to_vec(),
+            options: vec![TaskOptions::default(); 4],
             succ: ids(&[1, 2, 3, 3]),
             start: vec![0, 2, 3, 4, 4],
             in_degree: vec![0, 1, 1, 2],
@@ -464,5 +567,62 @@ mod tests {
             err.to_string(),
             "task `a` needs `ghost`, which does not exist"
         );
+    }
+
+    #[test]
+    fn options_are_kept_per_task() {
+        let mut gpu = task("train", &[]);
+        gpu.options.slots = 4;
+        gpu.options.labels = vec!["gpu".to_owned()];
+        let graph = Graph::build(&[task("fetch", &[]), gpu]).unwrap();
+        assert_eq!(graph.options(TaskId::new(0)), &TaskOptions::default());
+        assert_eq!(graph.options(TaskId::new(1)).slots, 4);
+        assert_eq!(graph.options(TaskId::new(1)).labels, ["gpu"]);
+    }
+
+    #[test]
+    fn zero_slots_are_rejected() {
+        let mut free = task("a", &[]);
+        free.options.slots = 0;
+        assert_eq!(
+            Graph::build(&[free]).unwrap_err(),
+            DagError::ZeroSlots("a".to_owned())
+        );
+    }
+
+    #[test]
+    fn retry_delay_doubles() {
+        let options = TaskOptions::default();
+        assert_eq!(options.retry_delay_after(1), Duration::from_secs(30));
+        assert_eq!(options.retry_delay_after(2), Duration::from_secs(60));
+        assert_eq!(options.retry_delay_after(3), Duration::from_secs(120));
+    }
+
+    #[test]
+    fn fixed_retry_delay_stays_the_same() {
+        let options = TaskOptions {
+            retry_backoff: Backoff::Fixed,
+            ..TaskOptions::default()
+        };
+        assert_eq!(options.retry_delay_after(1), Duration::from_secs(30));
+        assert_eq!(options.retry_delay_after(5), Duration::from_secs(30));
+    }
+
+    #[test]
+    fn retry_delay_stops_at_the_cap() {
+        let options = TaskOptions {
+            max_retry_delay: Some(Duration::from_secs(60)),
+            ..TaskOptions::default()
+        };
+        assert_eq!(options.retry_delay_after(2), Duration::from_secs(60));
+        assert_eq!(options.retry_delay_after(3), Duration::from_secs(60));
+        assert_eq!(options.retry_delay_after(u32::MAX), Duration::from_secs(60));
+    }
+
+    #[test]
+    fn retry_delay_saturates() {
+        let options = TaskOptions::default();
+        assert_eq!(options.retry_delay_after(40), Duration::MAX);
+        assert_eq!(options.retry_delay_after(u32::MAX), Duration::MAX);
     }
 }

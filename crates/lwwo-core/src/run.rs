@@ -281,12 +281,13 @@ impl Run {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dag::TaskDef;
+    use crate::dag::{TaskDef, TaskOptions};
 
     fn task(name: &str, needs: &[&str]) -> TaskDef {
         TaskDef {
             name: name.to_owned(),
             needs: needs.iter().map(|&n| n.to_owned()).collect(),
+            options: TaskOptions::default(),
         }
     }
 
