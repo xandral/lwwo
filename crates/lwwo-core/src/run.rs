@@ -5,10 +5,21 @@
 //! by one, and a task whose counter reaches zero is ready. When a task fails,
 //! everything that depends on it, directly or not, is skipped, while
 //! independent branches go on.
+//!
+//! A task with `retries` left does not fail at once: it waits in
+//! `Retrying`, then goes back to `Blocked` to be assigned again.
+//!
+//! ```text
+//! Blocked  ── assign ──→  Assigned  ── succeed ──→  Success
+//!                         Assigned  ── fail, attempts left ──→  Retrying
+//!                         Assigned  ── fail, none left ──→  Failed (descendants Skipped)
+//! Retrying ── retry_due ──→  Blocked
+//! ```
 
 use std::error::Error;
 use std::fmt;
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::dag::{Graph, TaskId};
 
@@ -67,6 +78,22 @@ pub enum RunOutcome {
     Failed,
 }
 
+/// What a failed attempt leads to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Failure {
+    /// The task has attempts left: it is `Retrying`, and should be retried
+    /// with [`Run::retry_due`] after this delay.
+    Retry {
+        /// How long to wait before the next attempt.
+        delay: Duration,
+    },
+    /// The task failed for good.
+    Final {
+        /// The tasks skipped because they depend on it, in any order.
+        skipped: Vec<TaskId>,
+    },
+}
+
 /// A change that does not fit the current state of a task.
 ///
 /// Delivery from workers is at-least-once, so the same report can arrive
@@ -87,6 +114,13 @@ pub enum RunError {
         /// Its current state.
         state: TaskState,
     },
+    /// The task is not waiting for a retry.
+    NotRetrying {
+        /// The task.
+        task: TaskId,
+        /// Its current state.
+        state: TaskState,
+    },
 }
 
 impl fmt::Display for RunError {
@@ -97,6 +131,13 @@ impl fmt::Display for RunError {
             }
             Self::NotAssigned { task, state } => {
                 write!(f, "task {} is not running: it is {state:?}", task.index())
+            }
+            Self::NotRetrying { task, state } => {
+                write!(
+                    f,
+                    "task {} is not waiting to retry: it is {state:?}",
+                    task.index()
+                )
             }
         }
     }
@@ -116,6 +157,8 @@ pub struct Run {
     missing: Vec<usize>,
     /// State of each task, indexed by task.
     states: Vec<TaskState>,
+    /// Attempts made so far, indexed by task: `task_runs.attempts`.
+    attempts: Vec<u32>,
     /// Tasks not yet in a final state.
     open: usize,
     /// Whether some task has failed.
@@ -130,6 +173,7 @@ impl Run {
             id,
             missing: graph.in_degree().to_vec(),
             states: vec![TaskState::Blocked; graph.len()],
+            attempts: vec![0; graph.len()],
             open: graph.len(),
             any_failed: false,
             graph,
@@ -158,6 +202,16 @@ impl Run {
         self.states[t.index()]
     }
 
+    /// Attempts made so far for task `t`: 0 before it is first assigned.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `t` does not belong to this run's graph.
+    #[must_use]
+    pub fn attempts(&self, t: TaskId) -> u32 {
+        self.attempts[t.index()]
+    }
+
     /// Tasks ready at the start of the run: those with no dependencies.
     #[must_use]
     pub fn initial_ready(&self) -> Vec<TaskId> {
@@ -183,7 +237,7 @@ impl Run {
         }
     }
 
-    /// Marks a ready task as sent to a worker.
+    /// Marks a ready task as sent to a worker, starting a new attempt.
     ///
     /// # Errors
     ///
@@ -201,6 +255,7 @@ impl Run {
             });
         }
         self.states[t.index()] = TaskState::Assigned;
+        self.attempts[t.index()] += 1;
         Ok(())
     }
 
@@ -236,9 +291,11 @@ impl Run {
         Ok(ready)
     }
 
-    /// Records that an assigned task failed for good, skips every task that
-    /// depends on it directly or indirectly, and returns the skipped tasks
-    /// in any order.
+    /// Records that an attempt of an assigned task failed.
+    ///
+    /// With attempts left the task waits to retry. Otherwise it fails for
+    /// good, and every task that depends on it, directly or not, is
+    /// skipped.
     ///
     /// # Errors
     ///
@@ -247,12 +304,15 @@ impl Run {
     /// # Panics
     ///
     /// Panics if `t` does not belong to this run's graph.
-    pub fn fail(&mut self, t: TaskId) -> Result<Vec<TaskId>, RunError> {
+    pub fn fail(&mut self, t: TaskId) -> Result<Failure, RunError> {
         if self.state(t) != TaskState::Assigned {
             return Err(RunError::NotAssigned {
                 task: t,
                 state: self.state(t),
             });
+        }
+        if let Some(delay) = self.start_retry(t) {
+            return Ok(Failure::Retry { delay });
         }
         self.states[t.index()] = TaskState::Failed;
         self.open -= 1;
@@ -274,7 +334,44 @@ impl Run {
                 }
             }
         }
-        Ok(skipped)
+        Ok(Failure::Final { skipped })
+    }
+
+    /// Puts a task whose attempt just failed in `Retrying`, if it has
+    /// attempts left, and returns how long to wait before the next one.
+    ///
+    /// A task has `1 + retries` attempts in all, so with `retries: 2` the
+    /// first two failures retry and the third is final.
+    fn start_retry(&mut self, t: TaskId) -> Option<Duration> {
+        let options = self.graph.options(t);
+        let attempts = self.attempts[t.index()];
+        if attempts > options.retries {
+            return None;
+        }
+        self.states[t.index()] = TaskState::Retrying;
+        Some(options.retry_delay_after(attempts))
+    }
+
+    /// Records that the wait of a retrying task is over: it is `Blocked`
+    /// again, and ready to be assigned.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RunError::NotRetrying`] if the task is not retrying, for
+    /// example when the run was cancelled during the wait.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `t` does not belong to this run's graph.
+    pub fn retry_due(&mut self, t: TaskId) -> Result<(), RunError> {
+        if self.state(t) != TaskState::Retrying {
+            return Err(RunError::NotRetrying {
+                task: t,
+                state: self.state(t),
+            });
+        }
+        self.states[t.index()] = TaskState::Blocked;
+        Ok(())
     }
 }
 
@@ -297,6 +394,12 @@ mod tests {
 
     fn t(index: u32) -> TaskId {
         TaskId::new(index)
+    }
+
+    fn retried(name: &str, needs: &[&str], retries: u32) -> TaskDef {
+        let mut def = task(name, needs);
+        def.options.retries = retries;
+        def
     }
 
     /// A run of `tasks`, with id 1.
@@ -338,6 +441,26 @@ mod tests {
         );
         assert!(!run.is_finished());
         assert_eq!(run.outcome(), None);
+    }
+
+    #[test]
+    fn assign_counts_attempts() {
+        let mut run = diamond();
+        assert_eq!(run.attempts(t(0)), 0);
+        run.assign(t(0)).unwrap();
+        assert_eq!(run.attempts(t(0)), 1);
+    }
+
+    #[test]
+    fn retry_due_of_a_task_that_is_not_retrying_is_an_error() {
+        let mut run = diamond();
+        assert_eq!(
+            run.retry_due(t(0)),
+            Err(RunError::NotRetrying {
+                task: t(0),
+                state: TaskState::Blocked
+            })
+        );
     }
 
     #[test]
@@ -444,7 +567,7 @@ mod tests {
         assert_eq!(run.succeed(t(0)), Ok(ids(&[1])));
 
         run.assign(t(1)).unwrap();
-        assert_eq!(run.fail(t(1)), Ok(ids(&[2])));
+        assert_eq!(run.fail(t(1)), Ok(Failure::Final { skipped: ids(&[2]) }));
         assert_eq!(run.state(t(1)), TaskState::Failed);
         assert_eq!(run.state(t(2)), TaskState::Skipped);
         assert_eq!(run.outcome(), None, "the other branch is still running");
@@ -462,7 +585,9 @@ mod tests {
         // load(3) is reachable from extract(0) through both clean and count.
         let mut run = diamond();
         run.assign(t(0)).unwrap();
-        let mut skipped = run.fail(t(0)).unwrap();
+        let Ok(Failure::Final { mut skipped }) = run.fail(t(0)) else {
+            panic!("no retries, so the failure is final");
+        };
         skipped.sort();
         assert_eq!(skipped, ids(&[1, 2, 3]));
         assert!(run.is_finished());
@@ -477,6 +602,67 @@ mod tests {
             Err(RunError::NotAssigned {
                 task: t(1),
                 state: TaskState::Blocked
+            })
+        );
+    }
+
+    // TASK 25 (needs 5 to 7)
+
+    #[test]
+    fn failure_with_retries_left_waits_to_retry() {
+        let mut run = run_of(&[retried("a", &[], 2), task("b", &["a"])]);
+        run.assign(t(0)).unwrap();
+        assert_eq!(
+            run.fail(t(0)),
+            Ok(Failure::Retry {
+                delay: Duration::from_secs(30)
+            })
+        );
+        assert_eq!(run.state(t(0)), TaskState::Retrying);
+        assert_eq!(run.state(t(1)), TaskState::Blocked, "b is not skipped");
+        assert_eq!(run.outcome(), None);
+    }
+
+    #[test]
+    fn retries_run_out_then_the_failure_is_final() {
+        let mut run = run_of(&[retried("a", &[], 2), task("b", &["a"])]);
+        for delay in [30, 60] {
+            run.assign(t(0)).unwrap();
+            assert_eq!(
+                run.fail(t(0)),
+                Ok(Failure::Retry {
+                    delay: Duration::from_secs(delay)
+                })
+            );
+            run.retry_due(t(0)).unwrap();
+        }
+        run.assign(t(0)).unwrap();
+        assert_eq!(run.attempts(t(0)), 3);
+        assert_eq!(run.fail(t(0)), Ok(Failure::Final { skipped: ids(&[1]) }));
+        assert_eq!(run.outcome(), Some(RunOutcome::Failed));
+    }
+
+    #[test]
+    fn a_retry_can_succeed() {
+        let mut run = run_of(&[retried("a", &[], 1), task("b", &["a"])]);
+        run.assign(t(0)).unwrap();
+        run.fail(t(0)).unwrap();
+        run.retry_due(t(0)).unwrap();
+        run.assign(t(0)).unwrap();
+        assert_eq!(run.succeed(t(0)), Ok(ids(&[1])));
+        assert_eq!(run.attempts(t(0)), 2);
+    }
+
+    #[test]
+    fn a_retrying_task_cannot_be_assigned_before_it_is_due() {
+        let mut run = run_of(&[retried("a", &[], 1)]);
+        run.assign(t(0)).unwrap();
+        run.fail(t(0)).unwrap();
+        assert_eq!(
+            run.assign(t(0)),
+            Err(RunError::NotReady {
+                task: t(0),
+                state: TaskState::Retrying
             })
         );
     }
