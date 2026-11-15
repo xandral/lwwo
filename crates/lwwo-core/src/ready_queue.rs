@@ -89,6 +89,18 @@ impl ReadyQueue {
         Some((run, task))
     }
 
+    /// Every queued task, in the order the queue would serve the first
+    /// task of each run, then the rest of that run.
+    pub fn iter(&self) -> impl Iterator<Item = (RunId, TaskId)> + '_ {
+        self.turns.iter().flat_map(move |&run| {
+            self.tasks
+                .get(&run)
+                .into_iter()
+                .flatten()
+                .map(move |&task| (run, task))
+        })
+    }
+
     /// Removes every ready task of `run`, for example when the run is
     /// cancelled, and returns them oldest first. Other runs keep their turn.
     pub fn remove_run(&mut self, run: RunId) -> Vec<TaskId> {
@@ -215,5 +227,24 @@ mod tests {
         queue.push(A, t(0));
         assert!(queue.remove_run(B).is_empty());
         assert_eq!(queue.len(), 1);
+    }
+
+    #[test]
+    fn iter_shows_every_queued_task_without_taking_it() {
+        let mut queue = ReadyQueue::new();
+        let (a, b) = (RunId::new(1), RunId::new(2));
+        queue.push(a, TaskId::new(0));
+        queue.push(b, TaskId::new(5));
+        queue.push(a, TaskId::new(1));
+        let all: Vec<_> = queue.iter().collect();
+        assert_eq!(
+            all,
+            [
+                (a, TaskId::new(0)),
+                (a, TaskId::new(1)),
+                (b, TaskId::new(5))
+            ]
+        );
+        assert_eq!(queue.len(), 3, "nothing was taken");
     }
 }

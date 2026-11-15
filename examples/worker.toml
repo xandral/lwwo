@@ -1,0 +1,6 @@
+# lwwo worker --config examples/worker.toml
+master = "master.internal:7071"
+token_file = "/etc/lwwo/join.token"   # from `lwwo token worker`; only needed the first time
+slots = 8
+labels = ["big"]
+executors = ["process", "docker"]

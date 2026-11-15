@@ -1,0 +1,6 @@
+# One toolchain for everybody: laptops, the Linux container and CI. Clippy
+# gains lints with every release, and `-D warnings` would turn each new one
+# into a failure on whichever machine updated first. Raise it on purpose.
+[toolchain]
+channel = "1.96.1"
+components = ["clippy", "rustfmt"]

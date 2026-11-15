@@ -1,1 +1,5 @@
 target/
+/lwwo-data
+# Local only: test scripts and CI workflows are not published.
+/scripts/
+/.github/

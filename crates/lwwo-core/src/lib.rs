@@ -8,6 +8,7 @@ pub mod calendar;
 pub mod cron;
 pub mod dag;
 pub mod deadlines;
+pub mod engine;
 pub mod ready_queue;
 pub mod run;
 pub mod time;

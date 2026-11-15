@@ -78,7 +78,14 @@ impl Worker {
     /// Slots still free.
     #[must_use]
     pub fn free(&self) -> u32 {
-        self.slots - self.used
+        // A worker that came back with fewer slots than its tasks hold.
+        self.slots.saturating_sub(self.used)
+    }
+
+    /// The labels of the worker.
+    #[must_use]
+    pub fn labels(&self) -> &[String] {
+        &self.labels
     }
 
     /// Whether the worker takes new tasks: false while it drains.
@@ -93,6 +100,30 @@ impl Worker {
     pub fn can_host(&self, slots: u32, labels: &[String]) -> bool {
         self.accepting && self.free() >= slots && labels.iter().all(|l| self.labels.contains(l))
     }
+}
+
+/// Why no worker can take a task right now, from the most lasting reason
+/// to the most passing one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Blocker {
+    /// No worker is connected at all.
+    NoWorkers,
+    /// No connected worker has every label the task asks for. Holds the
+    /// labels no worker has; if each one is somewhere but never all on the
+    /// same worker, it holds them all.
+    MissingLabels(Vec<String>),
+    /// The workers with the labels are all smaller than the task.
+    TooFewSlots {
+        /// Slots the task takes.
+        needed: u32,
+        /// The most slots any worker with the labels has.
+        largest: u32,
+    },
+    /// The workers that could host it take nothing new: they drain, or are
+    /// short of disk or memory.
+    NotAccepting,
+    /// It fits, but the workers that fit are full for now.
+    Busy,
 }
 
 /// Compares the load of two workers after placing a task of `slots` slots
@@ -196,6 +227,24 @@ impl WorkerPool {
         Ok(())
     }
 
+    /// Takes `slots` slots on a worker for a task it is already running,
+    /// as a worker that reconnects says in its `Hello`. Unlike
+    /// [`select`](Self::select) it does not check that they are free.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkerError::Unknown`] if the worker is not connected.
+    pub fn reserve(&mut self, id: WorkerId, slots: u32) -> Result<(), WorkerError> {
+        let worker = self.workers.get_mut(&id).ok_or(WorkerError::Unknown(id))?;
+        worker.used = worker.used.saturating_add(slots);
+        Ok(())
+    }
+
+    /// The connected workers, in id order.
+    pub fn iter(&self) -> impl Iterator<Item = (WorkerId, &Worker)> {
+        self.workers.iter().map(|(&id, worker)| (id, worker))
+    }
+
     /// Frees `slots` slots on a worker when one of its tasks ends.
     ///
     /// # Errors
@@ -213,6 +262,53 @@ impl WorkerPool {
         }
         worker.used -= slots;
         Ok(())
+    }
+
+    /// Whether some worker takes new tasks and has a free slot: when not,
+    /// no task can be placed and there is no point in trying.
+    #[must_use]
+    pub fn has_free_slots(&self) -> bool {
+        self.workers.values().any(|w| w.accepting && w.free() > 0)
+    }
+
+    /// Why a task needing `slots` slots and `labels` cannot start on any
+    /// worker now, or `None` if some worker can host it.
+    #[must_use]
+    pub fn blocker(&self, slots: u32, labels: &[String]) -> Option<Blocker> {
+        if self.workers.is_empty() {
+            return Some(Blocker::NoWorkers);
+        }
+        let with_labels: Vec<&Worker> = self
+            .workers
+            .values()
+            .filter(|worker| labels.iter().all(|label| worker.labels.contains(label)))
+            .collect();
+        if with_labels.is_empty() {
+            let mut missing: Vec<String> = labels
+                .iter()
+                .filter(|label| self.workers.values().all(|w| !w.labels.contains(label)))
+                .cloned()
+                .collect();
+            if missing.is_empty() {
+                missing = labels.to_vec();
+            }
+            return Some(Blocker::MissingLabels(missing));
+        }
+        let big_enough: Vec<&&Worker> = with_labels.iter().filter(|w| w.slots >= slots).collect();
+        if big_enough.is_empty() {
+            let largest = with_labels.iter().map(|w| w.slots).max().unwrap_or(0);
+            return Some(Blocker::TooFewSlots {
+                needed: slots,
+                largest,
+            });
+        }
+        if big_enough.iter().all(|w| !w.accepting) {
+            return Some(Blocker::NotAccepting);
+        }
+        if big_enough.iter().any(|w| w.can_host(slots, labels)) {
+            return None;
+        }
+        Some(Blocker::Busy)
     }
 
     /// Chooses a worker for a task needing `slots` slots and `labels`, and
@@ -444,5 +540,44 @@ mod tests {
         assert_eq!(pool.select(1, &[]), Some(w(1)));
         pool.release(w(1), 1).unwrap();
         assert_eq!(pool.select(1, &[]), Some(w(3)));
+    }
+
+    #[test]
+    fn the_blocker_says_why_nothing_fits() {
+        let labels =
+            |names: &[&str]| -> Vec<String> { names.iter().map(|&n| n.to_owned()).collect() };
+        let mut pool = WorkerPool::new();
+        assert_eq!(pool.blocker(1, &[]), Some(Blocker::NoWorkers));
+
+        pool.add(WorkerId::new(1), Worker::new(2, labels(&["big"])))
+            .unwrap();
+        pool.add(WorkerId::new(2), Worker::new(4, labels(&["gpu"])))
+            .unwrap();
+        assert_eq!(pool.blocker(1, &labels(&["big"])), None);
+        assert_eq!(
+            pool.blocker(1, &labels(&["big", "tpu"])),
+            Some(Blocker::MissingLabels(labels(&["tpu"]))),
+            "the label nobody has"
+        );
+        assert_eq!(
+            pool.blocker(1, &labels(&["big", "gpu"])),
+            Some(Blocker::MissingLabels(labels(&["big", "gpu"]))),
+            "each label is somewhere, never both together"
+        );
+        assert_eq!(
+            pool.blocker(3, &labels(&["big"])),
+            Some(Blocker::TooFewSlots {
+                needed: 3,
+                largest: 2
+            })
+        );
+
+        assert_eq!(pool.select(2, &labels(&["big"])), Some(WorkerId::new(1)));
+        assert_eq!(pool.blocker(1, &labels(&["big"])), Some(Blocker::Busy));
+        pool.set_accepting(WorkerId::new(2), false).unwrap();
+        assert_eq!(
+            pool.blocker(1, &labels(&["gpu"])),
+            Some(Blocker::NotAccepting)
+        );
     }
 }

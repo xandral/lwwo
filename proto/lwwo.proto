@@ -1,0 +1,154 @@
+// The contract between the lwwo master and its workers.
+//
+// A worker opens one `Session` stream and keeps it open: every message of
+// the protocol travels on it. Logs go on a separate `Logs` stream, so that a
+// heartbeat never waits behind megabytes of output. `Join` and `Renew` give a
+// worker its certificate.
+syntax = "proto3";
+
+package lwwo.v1;
+
+service Master {
+  // Exchanges the join token for a certificate signed by the master's CA.
+  rpc Join(JoinRequest) returns (JoinReply);
+  // Replaces a certificate that is about to expire. Needs the current one.
+  rpc Renew(RenewRequest) returns (JoinReply);
+  // The session of a worker: the first message must be `Hello`.
+  rpc Session(stream WorkerMessage) returns (stream MasterMessage);
+  // Output of the tasks, in chunks; every chunk is acknowledged.
+  rpc Logs(stream LogChunk) returns (stream LogAck);
+}
+
+message JoinRequest {
+  string secret = 1;  // the secret part of the join token
+  string name = 2;    // the name the worker asks for
+  string csr_pem = 3; // certificate signing request, for a key that never leaves the worker
+}
+
+message RenewRequest {
+  string csr_pem = 1;
+}
+
+message JoinReply {
+  string certificate_pem = 1;
+  string ca_pem = 2;
+}
+
+// One attempt of a task of a run.
+message TaskRef {
+  string run_id = 1;
+  string task = 2;
+  uint32 attempt = 3; // from 1; 0 in `Cancel` means any attempt
+}
+
+message Hello {
+  string worker_id = 1;
+  uint32 slots = 2;
+  repeated string labels = 3;    // "gpu", "big", "docker"
+  repeated string executors = 4; // "process", "docker", "podman"
+  uint64 total_memory = 5;
+  repeated TaskRef in_flight = 6; // running, or finished and not yet confirmed
+  uint32 protocol = 7;            // the version of this contract the worker speaks
+}
+
+message Heartbeat {
+  repeated TaskRef in_flight = 1;
+  uint64 available_memory = 2; // informative: for the TUI
+  uint64 free_disk = 3;
+  bool accepting = 4;          // false = "send me nothing more for now"
+}
+
+message Ack {
+  TaskRef task = 1;
+  bool accepted = 2;
+  string reason = 3;
+}
+
+enum Outcome {
+  OUTCOME_UNSPECIFIED = 0;
+  OUTCOME_SUCCESS = 1;
+  OUTCOME_FAILED = 2;
+  OUTCOME_TIMEOUT = 3;
+  OUTCOME_CANCELLED = 4;
+  OUTCOME_LOST = 5; // the worker cannot say how it ended: try again
+}
+
+message Started {
+  int64 started_at = 1; // UTC milliseconds
+}
+
+message Finished {
+  Outcome outcome = 1;
+  optional int32 exit_code = 2;
+  int64 started_at = 3;
+  int64 finished_at = 4;
+  optional uint64 peak_memory = 5; // bytes
+  string error = 6;                // why it could not start, if it could not
+}
+
+message Report {
+  TaskRef task = 1;
+  oneof kind {
+    Started started = 2;
+    Finished finished = 3;
+  }
+}
+
+message GitSource {
+  string git = 1;
+  string ref = 2;
+}
+
+message Assign {
+  TaskRef task = 1;
+  string dag = 2;
+  repeated string command = 3;    // templates already rendered
+  map<string, string> env = 4;    // the task's `env` plus the LWWO_* variables
+  optional string image = 5;      // none: a process on the host
+  optional GitSource source = 6;
+  repeated string pass_env = 7;
+  repeated string volumes = 8;
+  optional uint64 timeout_ms = 9; // measured by the worker
+  uint32 slots = 10;
+}
+
+message Cancel {
+  TaskRef task = 1;
+}
+
+message Drain {}
+
+message Confirm {
+  TaskRef task = 1;
+}
+
+message WorkerMessage {
+  oneof kind {
+    Hello hello = 1;
+    Heartbeat heartbeat = 2;
+    Ack ack = 3;
+    Report report = 4;
+  }
+}
+
+message MasterMessage {
+  oneof kind {
+    Assign assign = 1;
+    Cancel cancel = 2;
+    Drain drain = 3;
+    Confirm confirm = 4;
+  }
+}
+
+message LogChunk {
+  TaskRef task = 1;
+  string dag = 2;
+  uint64 offset = 3; // position of `data` in the attempt's output
+  bytes data = 4;
+  bool last = 5;     // nothing follows: the master can close the file
+}
+
+message LogAck {
+  TaskRef task = 1;
+  uint64 received = 2; // bytes the master has: where to continue from
+}

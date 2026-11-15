@@ -1,0 +1,2 @@
+# Names that are not code, so they need no backticks in doc comments.
+doc-valid-idents = ["SQLite", "gRPC", "UUIDv7", ".."]

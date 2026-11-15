@@ -1,0 +1,37 @@
+# A small nightly ETL that runs anywhere: every task is a shell command.
+#
+#   lwwo standalone                      # in one terminal
+#   lwwo apply examples/dags/etl_sales.yaml
+#   lwwo run etl_sales --param country=FR
+#   lwwo tui
+name: etl_sales
+schedule: "0 3 * * *"          # every day at 03:00
+timezone: Europe/Rome
+catchup: false
+overlap: queue
+
+params:
+  country: IT
+
+defaults:
+  retries: 2
+  retry_delay: 5s
+  timeout: 10m
+
+tasks:
+  extract:
+    run: ["sh", "-c", "echo extracting {{ params.country }} for {{ run.date }}; sleep 2"]
+
+  clean:
+    needs: [extract]
+    # Fails the first time, to show a retry.
+    run: ["sh", "-c", "echo cleaning, attempt $LWWO_ATTEMPT; test $LWWO_ATTEMPT -ge 2"]
+
+  count:
+    needs: [extract]
+    run: ["sh", "-c", "echo counting in $LWWO_WORKDIR; sleep 1"]
+
+  load:
+    needs: [clean, count]
+    run: ["echo", "loading s3://data/{{ run.date }}/{{ params.country }}.parquet for run {{ run.id }}"]
+    retries: 0

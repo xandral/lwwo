@@ -1,0 +1,23 @@
+# lwwo master --config examples/master.toml
+[api]
+listen = "0.0.0.0:7070"       # with tokens the API is always behind TLS
+
+[workers]
+listen = "0.0.0.0:7071"
+
+[storage]
+data_dir = "/var/lib/lwwo"
+retention = "30d"
+
+[dags]
+default_timezone = "Europe/Rome"
+
+[defaults]
+overlap = "queue"
+
+# Alerts are off unless a webhook is given. Each alert is a JSON POST with
+# a readable `text` field (what Slack shows) and the details beside it.
+# [alerts]
+# webhook = "https://hooks.slack.com/services/..."
+# waiting_after = "15m"      # a ready task that finds no worker for this long
+# on_failure = true          # every run that ends as failed

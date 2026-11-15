@@ -3,6 +3,7 @@ name = "lwwo-core"
 description = "Decision core of lwwo: pure logic, no I/O"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 rust-version.workspace = true
 
 [lints]

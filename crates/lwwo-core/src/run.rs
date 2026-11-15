@@ -13,8 +13,13 @@
 //! Blocked  ── assign ──→  Assigned  ── succeed ──→  Success
 //!                         Assigned  ── fail, attempts left ──→  Retrying
 //!                         Assigned  ── fail, none left ──→  Failed (descendants Skipped)
-//! Retrying ── retry_due ──→  Blocked
+//! Assigned  ── requeue (worker lost) ──→  Blocked
+//! Retrying  ── retry_due ──→  Blocked
+//! any open task  ── cancel ──→  Cancelled
 //! ```
+//!
+//! Only failures use up retries: an attempt lost with its worker is
+//! counted in `attempts`, but the task goes back to the queue as it was.
 
 use std::error::Error;
 use std::fmt;
@@ -59,13 +64,18 @@ pub enum TaskState {
     Failed,
     /// Not run because a task it depends on failed.
     Skipped,
+    /// Not finished because the run was cancelled.
+    Cancelled,
 }
 
 impl TaskState {
     /// Whether the task will not change any more in this run.
     #[must_use]
     pub const fn is_final(self) -> bool {
-        matches!(self, Self::Success | Self::Failed | Self::Skipped)
+        matches!(
+            self,
+            Self::Success | Self::Failed | Self::Skipped | Self::Cancelled
+        )
     }
 }
 
@@ -76,6 +86,8 @@ pub enum RunOutcome {
     Success,
     /// At least one task failed.
     Failed,
+    /// The run was cancelled before it finished.
+    Cancelled,
 }
 
 /// What a failed attempt leads to.
@@ -121,6 +133,15 @@ pub enum RunError {
         /// Its current state.
         state: TaskState,
     },
+    /// The run still has open tasks, so it cannot be run again yet.
+    NotFinished,
+    /// A snapshot does not have one entry per task of the graph.
+    WrongTaskCount {
+        /// Tasks in the graph.
+        expected: usize,
+        /// Entries in the snapshot.
+        found: usize,
+    },
 }
 
 impl fmt::Display for RunError {
@@ -139,11 +160,43 @@ impl fmt::Display for RunError {
                     task.index()
                 )
             }
+            Self::NotFinished => f.write_str("the run is not finished"),
+            Self::WrongTaskCount { expected, found } => {
+                write!(f, "the graph has {expected} tasks, the snapshot {found}")
+            }
         }
     }
 }
 
 impl Error for RunError {}
+
+/// What the database knows of a task, for loading a run back into memory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TaskSnapshot {
+    /// `task_runs.state`.
+    pub state: TaskState,
+    /// `task_runs.attempts`.
+    pub attempts: u32,
+    /// Attempts that ended as failed or timed out since the task was last
+    /// started from scratch: what retries are counted against.
+    pub failures: u32,
+}
+
+/// Which tasks of a finished run to run again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Rerun {
+    /// The tasks that did not succeed: failed, skipped or cancelled.
+    Failed,
+    /// One task.
+    Task {
+        /// The task.
+        task: TaskId,
+        /// Also every task that depends on it, directly or not.
+        downstream: bool,
+    },
+    /// Every task.
+    All,
+}
 
 /// One run of a DAG version.
 ///
@@ -159,10 +212,14 @@ pub struct Run {
     states: Vec<TaskState>,
     /// Attempts made so far, indexed by task: `task_runs.attempts`.
     attempts: Vec<u32>,
+    /// Failed attempts, indexed by task: what retries are counted against.
+    failures: Vec<u32>,
     /// Tasks not yet in a final state.
     open: usize,
     /// Whether some task has failed.
     any_failed: bool,
+    /// Whether the run was cancelled.
+    cancelled: bool,
 }
 
 impl Run {
@@ -174,10 +231,152 @@ impl Run {
             missing: graph.in_degree().to_vec(),
             states: vec![TaskState::Blocked; graph.len()],
             attempts: vec![0; graph.len()],
+            failures: vec![0; graph.len()],
             open: graph.len(),
             any_failed: false,
+            cancelled: false,
             graph,
         }
+    }
+
+    /// Loads a run back from the database, after a restart of the master
+    /// or to run a finished run again.
+    ///
+    /// The counters are computed again from the states. A blocked task
+    /// behind one that did not succeed can never start, so it is skipped.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RunError::WrongTaskCount`] if `tasks` does not have one
+    /// entry per task of `graph`, in graph order.
+    pub fn restore(id: RunId, graph: Arc<Graph>, tasks: &[TaskSnapshot]) -> Result<Self, RunError> {
+        if tasks.len() != graph.len() {
+            return Err(RunError::WrongTaskCount {
+                expected: graph.len(),
+                found: tasks.len(),
+            });
+        }
+        let mut run = Self::new(id, graph);
+        for (i, task) in tasks.iter().enumerate() {
+            run.states[i] = task.state;
+            run.attempts[i] = task.attempts;
+            run.failures[i] = task.failures;
+        }
+        run.recount();
+        Ok(run)
+    }
+
+    /// Computes `missing`, `open` and the two flags again from the states,
+    /// and skips the blocked tasks that can no longer start.
+    fn recount(&mut self) {
+        // Skip what sits behind a task that did not succeed. An explicit
+        // stack, as in `fail`.
+        let mut stack: Vec<TaskId> = self
+            .graph
+            .tasks()
+            .filter(|t| {
+                let state = self.states[t.index()];
+                state.is_final() && state != TaskState::Success
+            })
+            .collect();
+        while let Some(u) = stack.pop() {
+            for &succ in self.graph.successors(u) {
+                if self.states[succ.index()] == TaskState::Blocked {
+                    self.states[succ.index()] = TaskState::Skipped;
+                    stack.push(succ);
+                }
+            }
+        }
+
+        self.missing.fill(0);
+        for t in self.graph.tasks() {
+            if self.states[t.index()] != TaskState::Success {
+                for &succ in self.graph.successors(t) {
+                    self.missing[succ.index()] += 1;
+                }
+            }
+        }
+        self.open = self.states.iter().filter(|s| !s.is_final()).count();
+        self.any_failed = self.states.contains(&TaskState::Failed);
+        self.cancelled = self.states.contains(&TaskState::Cancelled);
+    }
+
+    /// Tasks that can be assigned now: blocked, with no dependency missing.
+    #[must_use]
+    pub fn ready(&self) -> Vec<TaskId> {
+        self.graph
+            .tasks()
+            .filter(|t| {
+                self.states[t.index()] == TaskState::Blocked && self.missing[t.index()] == 0
+            })
+            .collect()
+    }
+
+    /// Failed attempts of task `t` that count against its retries.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `t` does not belong to this run's graph.
+    #[must_use]
+    pub fn failures(&self, t: TaskId) -> u32 {
+        self.failures[t.index()]
+    }
+
+    /// Reopens a finished run: the tasks chosen by `scope` go back to
+    /// `Blocked` with their retries restored, and keep their attempt
+    /// count, so the history stays in one run. Returns the tasks whose
+    /// state changed, in ascending order; [`ready`](Self::ready) then says
+    /// which can start.
+    ///
+    /// A task behind one that still has not succeeded stays skipped: with
+    /// `Rerun::Task` on a task whose dependency failed, nothing can start.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RunError::NotFinished`] if some task is still open.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the task of `Rerun::Task` does not belong to this run's
+    /// graph.
+    pub fn rerun(&mut self, scope: Rerun) -> Result<Vec<TaskId>, RunError> {
+        if !self.is_finished() {
+            return Err(RunError::NotFinished);
+        }
+        let before = self.states.clone();
+        let mut chosen = vec![false; self.graph.len()];
+        match scope {
+            Rerun::All => chosen.fill(true),
+            Rerun::Failed => {
+                for (i, state) in self.states.iter().enumerate() {
+                    chosen[i] = *state != TaskState::Success;
+                }
+            }
+            Rerun::Task { task, downstream } => {
+                chosen[task.index()] = true;
+                let mut stack = if downstream { vec![task] } else { Vec::new() };
+                while let Some(u) = stack.pop() {
+                    for &succ in self.graph.successors(u) {
+                        if !chosen[succ.index()] {
+                            chosen[succ.index()] = true;
+                            stack.push(succ);
+                        }
+                    }
+                }
+            }
+        }
+        for (i, &chosen) in chosen.iter().enumerate() {
+            if chosen {
+                self.states[i] = TaskState::Blocked;
+                self.failures[i] = 0;
+            }
+        }
+        self.recount();
+        Ok(self
+            .graph
+            .tasks()
+            .filter(|t| self.states[t.index()] != before[t.index()])
+            .collect())
     }
 
     /// The id of this run.
@@ -230,10 +429,11 @@ impl Run {
     /// How the run ended, or `None` while some task is still open.
     #[must_use]
     pub fn outcome(&self) -> Option<RunOutcome> {
-        match (self.is_finished(), self.any_failed) {
-            (false, _) => None,
-            (true, false) => Some(RunOutcome::Success),
-            (true, true) => Some(RunOutcome::Failed),
+        match (self.is_finished(), self.cancelled, self.any_failed) {
+            (false, _, _) => None,
+            (true, true, _) => Some(RunOutcome::Cancelled),
+            (true, false, false) => Some(RunOutcome::Success),
+            (true, false, true) => Some(RunOutcome::Failed),
         }
     }
 
@@ -340,16 +540,17 @@ impl Run {
     /// Puts a task whose attempt just failed in `Retrying`, if it has
     /// attempts left, and returns how long to wait before the next one.
     ///
-    /// A task has `1 + retries` attempts in all, so with `retries: 2` the
-    /// first two failures retry and the third is final.
+    /// A task may fail `1 + retries` times, so with `retries: 2` the first
+    /// two failures retry and the third is final.
     fn start_retry(&mut self, t: TaskId) -> Option<Duration> {
+        self.failures[t.index()] += 1;
         let options = self.graph.options(t);
-        let attempts = self.attempts[t.index()];
-        if attempts > options.retries {
+        let failures = self.failures[t.index()];
+        if failures > options.retries {
             return None;
         }
         self.states[t.index()] = TaskState::Retrying;
-        Some(options.retry_delay_after(attempts))
+        Some(options.retry_delay_after(failures))
     }
 
     /// Records that the wait of a retrying task is over: it is `Blocked`
@@ -372,6 +573,45 @@ impl Run {
         }
         self.states[t.index()] = TaskState::Blocked;
         Ok(())
+    }
+
+    /// Puts an assigned task back to `Blocked`, ready to be assigned again,
+    /// because its worker was lost. The lost attempt stays counted in
+    /// [`attempts`](Self::attempts) but does not use up a retry.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RunError::NotAssigned`] if the task is not assigned.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `t` does not belong to this run's graph.
+    pub fn requeue(&mut self, t: TaskId) -> Result<(), RunError> {
+        if self.state(t) != TaskState::Assigned {
+            return Err(RunError::NotAssigned {
+                task: t,
+                state: self.state(t),
+            });
+        }
+        self.states[t.index()] = TaskState::Blocked;
+        Ok(())
+    }
+
+    /// Cancels the run: every task not yet in a final state becomes
+    /// `Cancelled`, and is returned in ascending order. The run is then
+    /// finished, with [`RunOutcome::Cancelled`].
+    pub fn cancel(&mut self) -> Vec<TaskId> {
+        let open: Vec<TaskId> = self
+            .graph
+            .tasks()
+            .filter(|&t| !self.states[t.index()].is_final())
+            .collect();
+        for &t in &open {
+            self.states[t.index()] = TaskState::Cancelled;
+        }
+        self.open = 0;
+        self.cancelled = true;
+        open
     }
 }
 
@@ -665,5 +905,165 @@ mod tests {
                 state: TaskState::Retrying
             })
         );
+    }
+
+    #[test]
+    fn a_lost_attempt_does_not_use_up_a_retry() {
+        // No retries: only one failure is allowed.
+        let mut run = run_of(&[task("a", &[])]);
+        run.assign(t(0)).unwrap();
+        run.requeue(t(0)).unwrap();
+        assert_eq!(run.state(t(0)), TaskState::Blocked);
+        run.assign(t(0)).unwrap();
+        assert_eq!(run.attempts(t(0)), 2);
+        assert_eq!(run.fail(t(0)), Ok(Failure::Final { skipped: vec![] }));
+    }
+
+    #[test]
+    fn requeue_of_a_task_that_is_not_assigned_is_an_error() {
+        let mut run = diamond();
+        assert_eq!(
+            run.requeue(t(0)),
+            Err(RunError::NotAssigned {
+                task: t(0),
+                state: TaskState::Blocked
+            })
+        );
+    }
+
+    #[test]
+    fn cancel_closes_every_open_task() {
+        let mut run = diamond();
+        run.assign(t(0)).unwrap();
+        run.succeed(t(0)).unwrap();
+        run.assign(t(1)).unwrap();
+        assert_eq!(run.cancel(), ids(&[1, 2, 3]));
+        assert_eq!(run.state(t(0)), TaskState::Success);
+        assert_eq!(run.state(t(1)), TaskState::Cancelled);
+        assert!(run.is_finished());
+        assert_eq!(run.outcome(), Some(RunOutcome::Cancelled));
+    }
+
+    // Restore and rerun
+
+    fn snap(state: TaskState, attempts: u32) -> TaskSnapshot {
+        TaskSnapshot {
+            state,
+            attempts,
+            failures: 0,
+        }
+    }
+
+    #[test]
+    fn restore_recomputes_the_counters() {
+        let graph = Arc::clone(&diamond().graph);
+        let run = Run::restore(
+            RunId::new(1),
+            graph,
+            &[
+                snap(TaskState::Success, 1),
+                snap(TaskState::Assigned, 1),
+                snap(TaskState::Blocked, 0),
+                snap(TaskState::Blocked, 0),
+            ],
+        )
+        .unwrap();
+        assert_eq!(run.ready(), ids(&[2]));
+        assert_eq!(run.outcome(), None);
+        assert_eq!(run.attempts(t(1)), 1);
+    }
+
+    #[test]
+    fn restore_rejects_a_snapshot_of_the_wrong_size() {
+        let graph = Arc::clone(&diamond().graph);
+        assert_eq!(
+            Run::restore(RunId::new(1), graph, &[]).unwrap_err(),
+            RunError::WrongTaskCount {
+                expected: 4,
+                found: 0
+            }
+        );
+    }
+
+    #[test]
+    fn rerun_failed_reopens_the_failed_and_the_skipped() {
+        let mut run = diamond();
+        run.assign(t(0)).unwrap();
+        run.succeed(t(0)).unwrap();
+        run.assign(t(1)).unwrap();
+        run.assign(t(2)).unwrap();
+        run.succeed(t(2)).unwrap();
+        run.fail(t(1)).unwrap();
+        assert_eq!(run.outcome(), Some(RunOutcome::Failed));
+
+        assert_eq!(run.rerun(Rerun::Failed).unwrap(), ids(&[1, 3]));
+        assert_eq!(run.outcome(), None);
+        assert_eq!(run.ready(), ids(&[1]));
+        run.assign(t(1)).unwrap();
+        assert_eq!(run.attempts(t(1)), 2, "the history stays in the run");
+        assert_eq!(run.succeed(t(1)).unwrap(), ids(&[3]));
+        run.assign(t(3)).unwrap();
+        run.succeed(t(3)).unwrap();
+        assert_eq!(run.outcome(), Some(RunOutcome::Success));
+    }
+
+    #[test]
+    fn rerun_of_an_open_run_is_an_error() {
+        let mut run = diamond();
+        assert_eq!(run.rerun(Rerun::All).unwrap_err(), RunError::NotFinished);
+    }
+
+    #[test]
+    fn rerun_of_a_task_takes_its_descendants_only_when_asked() {
+        let finished = || {
+            let mut run = diamond();
+            for i in 0..4 {
+                run.assign(t(i)).unwrap();
+                run.succeed(t(i)).unwrap();
+            }
+            run
+        };
+        let mut run = finished();
+        let only = Rerun::Task {
+            task: t(1),
+            downstream: false,
+        };
+        assert_eq!(run.rerun(only).unwrap(), ids(&[1]));
+        assert_eq!(run.ready(), ids(&[1]));
+
+        let mut run = finished();
+        let with = Rerun::Task {
+            task: t(1),
+            downstream: true,
+        };
+        assert_eq!(run.rerun(with).unwrap(), ids(&[1, 3]));
+        assert_eq!(run.rerun(Rerun::All).unwrap_err(), RunError::NotFinished);
+    }
+
+    #[test]
+    fn rerun_restores_the_retries() {
+        let mut run = run_of(&[retried("a", &[], 1)]);
+        run.assign(t(0)).unwrap();
+        run.fail(t(0)).unwrap();
+        run.retry_due(t(0)).unwrap();
+        run.assign(t(0)).unwrap();
+        assert!(matches!(run.fail(t(0)).unwrap(), Failure::Final { .. }));
+        run.rerun(Rerun::Failed).unwrap();
+        run.assign(t(0)).unwrap();
+        assert!(matches!(run.fail(t(0)).unwrap(), Failure::Retry { .. }));
+        assert_eq!(run.attempts(t(0)), 3);
+    }
+
+    #[test]
+    fn a_task_behind_a_failed_one_stays_skipped() {
+        let mut run = run_of(&[task("a", &[]), task("b", &["a"])]);
+        run.assign(t(0)).unwrap();
+        run.fail(t(0)).unwrap();
+        let only_b = Rerun::Task {
+            task: t(1),
+            downstream: false,
+        };
+        assert!(run.rerun(only_b).unwrap().is_empty());
+        assert_eq!(run.outcome(), Some(RunOutcome::Failed));
     }
 }

@@ -1,0 +1,106 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1040 1328" width="1040" height="1328" role="img" aria-labelledby="t d">
+<title id="t">The events of a run in lwwo</title>
+<desc id="d">Sequence of events between client, master, SQLite, worker and shim, from apply to the end of a run.</desc>
+<style>text{paint-order:stroke;stroke:#ffffff;stroke-width:5px;stroke-linejoin:round;font-family:-apple-system,"Segoe UI",Helvetica,Arial,sans-serif}.h{font-size:15px;font-weight:600;fill:#1f2937}.s{font-size:12px;fill:#6b7280}.ph{font-size:13px;font-weight:600;fill:#1f2937;stroke:none}.m{font-size:12.5px;font-weight:500}.n{font-size:12.5px}.t{font-size:20px;font-weight:650;fill:#1f2937}.l{font-size:12px;fill:#6b7280}</style>
+<rect width="1040" height="1328" rx="14" fill="#ffffff" stroke="#cbd5e1"/>
+<text x="38" y="44" class="t">The events of a run</text>
+<text x="38" y="66" class="s">Every message to a worker is sent after the commit it depends on.</text>
+<line x1="100" y1="134" x2="100" y2="1270" stroke="#cbd5e1" stroke-width="1.5"/>
+<rect x="38" y="88" width="124" height="46" rx="9" fill="#ffffff" stroke="#1f2937" stroke-width="1.4"/>
+<text x="100" y="108" text-anchor="middle" class="h">Client</text>
+<text x="100" y="125" text-anchor="middle" class="s">CLI · TUI</text>
+<line x1="330" y1="134" x2="330" y2="1270" stroke="#cbd5e1" stroke-width="1.5"/>
+<rect x="268" y="88" width="124" height="46" rx="9" fill="#ffffff" stroke="#1f2937" stroke-width="1.4"/>
+<text x="330" y="108" text-anchor="middle" class="h">Master</text>
+<text x="330" y="125" text-anchor="middle" class="s">event loop</text>
+<line x1="520" y1="134" x2="520" y2="1270" stroke="#cbd5e1" stroke-width="1.5"/>
+<rect x="458" y="88" width="124" height="46" rx="9" fill="#ffffff" stroke="#1f2937" stroke-width="1.4"/>
+<text x="520" y="108" text-anchor="middle" class="h">SQLite</text>
+<text x="520" y="125" text-anchor="middle" class="s">durable state</text>
+<line x1="720" y1="134" x2="720" y2="1270" stroke="#cbd5e1" stroke-width="1.5"/>
+<rect x="658" y="88" width="124" height="46" rx="9" fill="#ffffff" stroke="#1f2937" stroke-width="1.4"/>
+<text x="720" y="108" text-anchor="middle" class="h">Worker</text>
+<text x="720" y="125" text-anchor="middle" class="s">session</text>
+<line x1="920" y1="134" x2="920" y2="1270" stroke="#cbd5e1" stroke-width="1.5"/>
+<rect x="858" y="88" width="124" height="46" rx="9" fill="#ffffff" stroke="#1f2937" stroke-width="1.4"/>
+<text x="920" y="108" text-anchor="middle" class="h">Shim</text>
+<text x="920" y="125" text-anchor="middle" class="s">one per task</text>
+<rect x="24" y="146" width="992" height="26" rx="6" fill="#f1f5f9"/>
+<text x="38" y="164" class="ph">1 · Apply</text>
+<line x1="106" y1="196" x2="318" y2="196" stroke="#2563eb" stroke-width="1.8"/>
+<path d="M326,196 l-10,-5 v10 z" fill="#2563eb"/>
+<text x="215.0" y="188" text-anchor="middle" class="m" fill="#2563eb">POST /dags (YAML)</text>
+<circle cx="330" cy="232" r="4.5" fill="#6b7280"/>
+<text x="344" y="236" text-anchor="start" class="n" fill="#6b7280">validate, build graph, reject cycles</text>
+<line x1="336" y1="270" x2="508" y2="270" stroke="#059669" stroke-width="1.8"/>
+<path d="M516,270 l-10,-5 v10 z" fill="#059669"/>
+<text x="425.0" y="262" text-anchor="middle" class="m" fill="#059669">save version, timetable</text>
+<circle cx="330" cy="306" r="4.5" fill="#b45309"/>
+<text x="344" y="310" text-anchor="start" class="n" fill="#b45309">arm the alarm on the next scheduled time</text>
+<rect x="24" y="340" width="992" height="26" rx="6" fill="#f1f5f9"/>
+<text x="38" y="358" class="ph">2 · Scheduled time</text>
+<circle cx="330" cy="386" r="4.5" fill="#b45309"/>
+<text x="344" y="390" text-anchor="start" class="n" fill="#b45309">kernel timer wakes the loop</text>
+<line x1="336" y1="424" x2="508" y2="424" stroke="#059669" stroke-width="1.8"/>
+<path d="M516,424 l-10,-5 v10 z" fill="#059669"/>
+<text x="425.0" y="416" text-anchor="middle" class="m" fill="#059669">query due DAGs, create run + tasks</text>
+<circle cx="330" cy="460" r="4.5" fill="#6b7280"/>
+<text x="344" y="464" text-anchor="start" class="n" fill="#6b7280">tasks with no dependencies become ready</text>
+<rect x="24" y="494" width="992" height="26" rx="6" fill="#f1f5f9"/>
+<text x="38" y="512" class="ph">3 · Push</text>
+<line x1="336" y1="544" x2="508" y2="544" stroke="#059669" stroke-width="1.8"/>
+<path d="M516,544 l-10,-5 v10 z" fill="#059669"/>
+<text x="425.0" y="536" text-anchor="middle" class="m" fill="#059669">save assignment</text>
+<circle cx="330" cy="580" r="4.5" fill="#6b7280"/>
+<text x="344" y="584" text-anchor="start" class="n" fill="#6b7280">commit first, then send</text>
+<line x1="336" y1="618" x2="708" y2="618" stroke="#2563eb" stroke-width="1.8"/>
+<path d="M716,618 l-10,-5 v10 z" fill="#2563eb"/>
+<text x="525.0" y="610" text-anchor="middle" class="m" fill="#2563eb">Assign</text>
+<line x1="726" y1="658" x2="908" y2="658" stroke="#2563eb" stroke-width="1.8"/>
+<path d="M916,658 l-10,-5 v10 z" fill="#2563eb"/>
+<text x="820.0" y="650" text-anchor="middle" class="m" fill="#2563eb">write spec.json, launch</text>
+<circle cx="920" cy="694" r="4.5" fill="#6b7280"/>
+<text x="906" y="698" text-anchor="end" class="n" fill="#6b7280">runs the task, enforces the timeout</text>
+<rect x="24" y="728" width="992" height="26" rx="6" fill="#f1f5f9"/>
+<text x="38" y="746" class="ph">4 · Execution</text>
+<line x1="914" y1="778" x2="732" y2="778" stroke="#2563eb" stroke-width="1.8" stroke-dasharray="6 5"/>
+<path d="M724,778 l10,-5 v10 z" fill="#2563eb"/>
+<text x="820.0" y="770" text-anchor="middle" class="m" fill="#2563eb">started.json · log</text>
+<line x1="714" y1="818" x2="342" y2="818" stroke="#2563eb" stroke-width="1.8"/>
+<path d="M334,818 l10,-5 v10 z" fill="#2563eb"/>
+<text x="525.0" y="810" text-anchor="middle" class="m" fill="#2563eb">Report: started  ·  log chunks</text>
+<line x1="336" y1="858" x2="708" y2="858" stroke="#2563eb" stroke-width="1.8" stroke-dasharray="6 5"/>
+<path d="M716,858 l-10,-5 v10 z" fill="#2563eb"/>
+<text x="525.0" y="850" text-anchor="middle" class="m" fill="#2563eb">bytes acknowledged</text>
+<rect x="24" y="894" width="992" height="26" rx="6" fill="#f1f5f9"/>
+<text x="38" y="912" class="ph">5 · Outcome</text>
+<line x1="914" y1="944" x2="732" y2="944" stroke="#2563eb" stroke-width="1.8" stroke-dasharray="6 5"/>
+<path d="M724,944 l10,-5 v10 z" fill="#2563eb"/>
+<text x="820.0" y="936" text-anchor="middle" class="m" fill="#2563eb">exit.json</text>
+<line x1="714" y1="984" x2="342" y2="984" stroke="#2563eb" stroke-width="1.8"/>
+<path d="M334,984 l10,-5 v10 z" fill="#2563eb"/>
+<text x="525.0" y="976" text-anchor="middle" class="m" fill="#2563eb">Report: finished</text>
+<line x1="336" y1="1024" x2="508" y2="1024" stroke="#059669" stroke-width="1.8"/>
+<path d="M516,1024 l-10,-5 v10 z" fill="#059669"/>
+<text x="425.0" y="1016" text-anchor="middle" class="m" fill="#059669">save outcome</text>
+<line x1="336" y1="1064" x2="708" y2="1064" stroke="#2563eb" stroke-width="1.8"/>
+<path d="M716,1064 l-10,-5 v10 z" fill="#2563eb"/>
+<text x="525.0" y="1056" text-anchor="middle" class="m" fill="#2563eb">Confirm  →  journal entry removed</text>
+<circle cx="330" cy="1100" r="4.5" fill="#6b7280"/>
+<text x="344" y="1104" text-anchor="start" class="n" fill="#6b7280">successors at zero go back to step 3</text>
+<rect x="24" y="1134" width="992" height="26" rx="6" fill="#f1f5f9"/>
+<text x="38" y="1152" class="ph">6 · End</text>
+<line x1="324" y1="1184" x2="112" y2="1184" stroke="#2563eb" stroke-width="1.8" stroke-dasharray="6 5"/>
+<path d="M104,1184 l10,-5 v10 z" fill="#2563eb"/>
+<text x="215.0" y="1176" text-anchor="middle" class="m" fill="#2563eb">/events: run finished</text>
+<circle cx="330" cy="1220" r="4.5" fill="#6b7280"/>
+<text x="344" y="1224" text-anchor="start" class="n" fill="#6b7280">run leaves memory; history stays in SQLite</text>
+<line x1="38" y1="1298" x2="68" y2="1298" stroke="#2563eb" stroke-width="1.8"/>
+<text x="76" y="1302" class="l">message</text>
+<line x1="146.4" y1="1298" x2="176.4" y2="1298" stroke="#2563eb" stroke-width="1.8" stroke-dasharray="6 5"/>
+<text x="184.4" y="1302" class="l">file or stream</text>
+<line x1="305.20000000000005" y1="1298" x2="335.20000000000005" y2="1298" stroke="#059669" stroke-width="1.8"/>
+<text x="343.20000000000005" y="1302" class="l">SQLite transaction</text>
+<circle cx="506.80000000000007" cy="1298" r="4.5" fill="#b45309"/>
+<text x="530.8000000000001" y="1302" class="l">timer</text>
+</svg>

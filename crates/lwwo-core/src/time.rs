@@ -5,6 +5,8 @@
 //! the binary implements with the IANA time zone database; the core only
 //! ships [`Utc`].
 
+use std::time::Duration;
+
 use crate::calendar::{Date, DateTime};
 
 const MS_PER_MINUTE: i64 = 60_000;
@@ -26,6 +28,14 @@ impl Timestamp {
     #[must_use]
     pub const fn as_millis(self) -> i64 {
         self.0
+    }
+
+    /// The instant `duration` after this one, stopping at the largest
+    /// instant instead of overflowing.
+    #[must_use]
+    pub fn saturating_add(self, duration: Duration) -> Self {
+        let millis = i64::try_from(duration.as_millis()).unwrap_or(i64::MAX);
+        Self(self.0.saturating_add(millis))
     }
 
     /// The instant at which a clock `offset` milliseconds ahead of UTC
@@ -143,5 +153,18 @@ mod tests {
             panic!("UTC times are unique");
         };
         assert_eq!(Utc.local(instant), local);
+    }
+
+    #[test]
+    fn saturating_add_stops_at_the_end_of_time() {
+        let t = Timestamp::from_millis(1_000);
+        assert_eq!(
+            t.saturating_add(Duration::from_secs(30)),
+            Timestamp::from_millis(31_000)
+        );
+        assert_eq!(
+            t.saturating_add(Duration::MAX),
+            Timestamp::from_millis(i64::MAX)
+        );
     }
 }
