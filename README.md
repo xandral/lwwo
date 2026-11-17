@@ -432,8 +432,8 @@ Known limits:
   must be idempotent.
 - Throughput is bounded by a single SQLite writer. Measured on a laptop:
   about 60 empty tasks per second on 16 slots.
-- The items not yet finished are listed in the design document under
-  "To fix".
+- The items not yet finished are listed in
+  [docs/status.md](docs/status.md) under "Known limitations".
 
 ## Development
 
@@ -450,8 +450,11 @@ worker, command line and TUI.
 
 ## Documentation
 
-- [docs/design.md](docs/design.md): the complete design, with every decision
-  taken and every alternative rejected.
+- [docs/design.md](docs/design.md): how lwwo works, component by component.
+- [docs/decisions.md](docs/decisions.md): why it works that way, with every
+  alternative rejected and when it would be reconsidered.
+- [docs/status.md](docs/status.md): what is implemented and verified, the
+  known limitations and the roadmap.
 - [docs/configuration.md](docs/configuration.md): every setting of master,
   worker, client and DAG file.
 - [docs/database.md](docs/database.md): the SQLite schema, table by table.

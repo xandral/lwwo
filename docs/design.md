@@ -2,11 +2,11 @@
 
 lwwo, the Lightweight Workflow Orchestrator, runs DAGs of tasks on a schedule: one Rust binary that is master, worker, command line and terminal interface, with SQLite as its only store.
 
-This document describes the complete design: how each part works, the reasons behind it, the alternatives rejected and the points still open. The [README](../README.md) is the introduction; [configuration.md](configuration.md) and [database.md](database.md) are the references.
+This document describes how lwwo works: every component, message, file and rule, precisely enough to reimplement it. The [README](../README.md) is the introduction; [configuration.md](configuration.md) and [database.md](database.md) are the references. Why each choice was made, and what was rejected, is in [decisions.md](decisions.md); what is implemented, measured and still missing is in [status.md](status.md).
 
 ## The design in brief
 
-Each line is a decision the rest of the document explains.
+Each line is a property the rest of the document explains.
 
 | | Fact | Why |
 | --- | --- | --- |
@@ -184,6 +184,11 @@ extract ──┬── clean ──┬── load
 4. **When a task succeeds,** the counter of each successor is decremented, and those that reach zero enter the queue.
 5. **When a task fails,** its successors can never reach zero and are marked as skipped.
 
+- **A failed task skips only its descendants.** Every task that depends on it, directly or through other tasks, becomes `skipped`; tasks on independent branches continue, and the run ends as `failed` once every task has finished. This is Airflow's `all_success` rule.
+- **Retries.** A failed attempt (non-zero exit code, `timeout`, or a refused `Assign`) is retried while the task has failed at most `retries` times; the task waits in `retrying` and then returns to the queue. The wait after the *n*-th failure is `retry_delay` × 2<sup>n−1</sup> with `retry_backoff: exponential` (the default) and `retry_delay` with `fixed`, in both cases capped at `max_retry_delay` when it is set. With the defaults, `retries: 0` and `retry_delay: 30s`, a failed task fails at once.
+- **A lost attempt is not a failure.** When its worker is lost, the attempt is recorded as `lost`, its number is used up, and the task returns to the queue without counting against `retries`.
+- **Worker selection.** Among the workers that accept tasks, have every label the task requires and have at least `slots` free slots, the master picks the one with the lowest share of slots in use *after* the assignment: `(used + slots) / total`. Ties go round-robin by worker id: the first tied worker after the one chosen last time, wrapping around. A task that fits on no worker stays in the queue without blocking the tasks behind it, and the master stops looking as soon as no worker has a free slot.
+
 The correct order follows without any sorting: a task reaches zero only when all its predecessors have finished. During a run only successors and counters are needed; predecessors are used to compute the in-degrees, for reruns and by the TUI.
 
 The successors of all tasks are stored in one vector, and a second vector gives the position where each task's successors start:
@@ -296,18 +301,6 @@ The service has four calls:
 - **The master sets the heartbeat interval,** in a header of the response to `Session`, from `[workers] heartbeat_interval`.
 - **An attempt is identified by run, task and attempt number,** so a duplicate or late outcome is only confirmed.
 - **The protocol is versioned.** `Hello` carries the version of the contract the worker speaks; when it differs from the master's, the session is refused with an explicit message.
-
-### Why gRPC
-
-|  | WebSocket | gRPC |
-| --- | --- | --- |
-| Message format | left to the application | protobuf, with generated code for master and worker |
-| Concurrent flows | one, in order | many independent streams on one connection |
-| Errors and closing | one code for the whole connection | a status per call, with deadlines and cancellation |
-| Clients in other languages | reimplement the protocol | generate it from the `.proto` |
-| Browser | native support | requires gRPC-Web |
-
-On a single WebSocket a heartbeat queued behind 50 MB of logs arrives late, and the master could consider the worker dead; with gRPC, logs travel on their own stream. proto3 has no required fields, so distinguishing zero from absent requires `optional`.
 
 The two messages with which a worker registers and signals liveness:
 
@@ -476,15 +469,6 @@ Failures are of two kinds and call for different measures:
 | the master process dies | the time of the restart: tasks continue on the workers, and none is run again afterwards | a supervisor that restarts it, such as systemd with `Restart=always` |
 | the machine or its disk is lost | all the state, unless a copy exists | replication of the SQLite file, for example with Litestream to S3, and a restart from the copy on another machine (not yet verified) |
 
-Other systems fall into four families:
-
-| Family | Examples | Mechanism |
-| --- | --- | --- |
-| restart and recover | the Spark driver; `lwwo` | the state is on disk and a supervisor restarts the process |
-| active and standby | Flink, the Spark Standalone master, the Kubernetes scheduler | an external arbiter (ZooKeeper, etcd) elects the leader |
-| stateless brain | Airflow 2, Temporal | several active instances over a database that is itself replicated |
-| built-in consensus | Docker Swarm, Nomad, etcd | Raft among three or five nodes, with no external service |
-
 ## Scheduling
 
 The timetable in the database states when each DAG is next due; two rules per DAG decide how delays and overlaps are handled.
@@ -492,12 +476,14 @@ The timetable in the database states when each DAG is next due; two rules per DA
 - **Timetable.** One row per DAG with its next scheduled time, kept only in the database. When that time arrives the master queries the DAGs that are due, creates their runs and advances their rows in the same transaction. It then queries the next scheduled time and arms the alarm on it; only that instant is kept in memory.
 - **Logical time.** Each run carries the time it was scheduled for, not the time it actually starts: the 03:00 run that is caught up at 05:30 still sees 03:00.
 - **Catch-up (`catchup`), as in Airflow 3.** With `false`, the default, only the most recent missed occurrence runs after an interruption; with `true` all of them run, in order. Missed occurrences are not created all at once: the timetable row stays behind and advances one occurrence at a time, as the overlap rule allows.
+- **Time zones and daylight saving.** The cron of a DAG is read in its `timezone`. A scheduled time that does not exist on a given day, such as 02:30 when clocks go forward from 02:00 to 03:00, runs at the first valid instant after it (03:00); several such times on the same day run once. A time that occurs twice, when clocks go back, runs only the first time.
+- **Pause.** Pausing a DAG removes its timetable row, so it is not even queried. Resuming recreates the row with the first occurrence after the moment of resuming: occurrences that fell during the pause are not caught up, whatever `catchup` says. Runs in progress are not affected by a pause.
 - **Manual runs.** `lwwo run` accepts `--at`, the logical time of the run, and `--param`, to override a parameter declared in the DAG. Past days are processed with a loop of manual runs, one per date; there is no backfill command. A paused DAG can still be run manually.
 
 | `overlap` | When a run is due while the previous one is still active |
 | --- | --- |
 | `queue` (default) | the new run waits and starts when the other ends |
-| `skip` | the occurrence is skipped and recorded |
+| `skip` | the occurrence is skipped; it is recorded only in the master's log (see [status.md](status.md)) |
 | `allow` | the runs overlap, up to `max_active`; beyond that the new run waits as with `queue` |
 | `replace` | the active run is cancelled and the new one starts |
 
@@ -531,7 +517,7 @@ lwwo rerun <run> --current            # with the current version, if the structu
 ```
 
 - A rerun uses the DAG version the run started with. The current version can be used only when its structure is identical, that is, the same tasks and dependencies; otherwise a new run is required.
-- A reopened run is subject to the overlap rule like a new run. It is not queued, however: while another run of the DAG is active the rerun is refused and must be requested again (see "To fix").
+- A reopened run is subject to the overlap rule like a new run. It is not queued, however: while another run of the DAG is active the rerun is refused and must be requested again (a known limitation, see [status.md](status.md)).
 - "Rerun failed" also includes cancelled tasks, so a cancelled run can be completed.
 - Only a finished run can be rerun. The retries of rerun tasks start from zero; attempt numbers continue.
 - A task that depends on a task still failed does not run: it remains skipped.
@@ -552,23 +538,67 @@ The orchestrator launches tasks and collects their outcomes; data and secrets re
 
 ## Logs
 
-Task logs are stored on the master: a single location, and the only one the clients talk to.
+Task logs are stored on the master, which is the only place clients read them from. Each attempt has its own log, from the first line to the last, and it moves in three steps:
 
 ```text
-task ─ stdout/stderr ─▶ worker: spool file ─ chunks ─▶ master: one file per attempt
-                                   ◀─ N bytes received ─┘      plain text (.log)
+task ─ stdout, stderr ─▶ shim ─ lines ─▶ spool file on the worker ─ chunks ─▶ master: one file per attempt
+                                         attempts/…/log           ◀─ ack: bytes held ─┘ logs/<dag>/<run>/<task>/<n>.log
 ```
 
-- The worker writes each line of stdout and stderr to a local spool file, with its time and stream, and ships it to the master in chunks on the log stream.
-- The master acknowledges each chunk with the number of bytes it holds. While the master is down the file grows on the worker, and shipping resumes from the last acknowledged byte: no line is lost or duplicated.
-- The outcome is sent only once the master has the whole log, so the two are saved together.
-- The master writes one plain-text file per attempt, outside SQLite: `.part` while the attempt runs, renamed to `.log` when it ends or is declared lost.
-- Logs are read in 4 MB pieces from any offset, so a large log is never held in memory.
-- Logs are not compressed. A plain file can be streamed from the middle without decoding what precedes it, and `retention` removes logs together with their runs.
-- On the worker the output of one attempt cannot exceed `log_spool_max`, so a task that writes endlessly does not fill the disk.
-- On the master each attempt is limited to `[logs] max_per_attempt`, 100 MB by default; beyond that the beginning and the end are kept.
-- The log also contains lines from `lwwo` itself, such as the notice that a task was stopped on timeout.
-- Logs are kept as long as run history, 30 days by default. Storing them on S3 instead of the master's disk is a possible extension.
+### Line format
+
+The shim, not the task, writes every line, and every line has the same three fields separated by a tab:
+
+```text
+<unix milliseconds>\t<stream>\t<text>\n
+1792980004123	O	18432 rows read
+1792980004127	E	warning: 112 rows without a customer id
+1792980060000	S	timeout: stopping the task
+```
+
+| Stream | Source |
+| --- | --- |
+| `O` | the task's standard output |
+| `E` | the task's standard error |
+| `S` | lwwo itself: the git checkout (`cloning …`, `git: …`), why the task was stopped (`timeout: stopping the task`, `cancelled: stopping the task`, `the worker has been away too long: stopping the task`), an error that prevented the start, and the notice that the spool limit was reached |
+
+- **The time is when the shim read the line,** in UTC milliseconds by the worker's clock. It is not a time the task printed, and it is not corrected for clock differences between machines.
+- **A line ends at `\n`.** The trailing `\n` or `\r\n` is removed, and the shim adds its own `\n`. Output that ends without a newline becomes a last line when the stream closes.
+- **Text is UTF-8.** Bytes that are not valid UTF-8 are replaced with `U+FFFD`. A tab inside the text is kept: only the first two tabs of a line separate fields.
+- **stdout and stderr are read separately,** so their relative order is the order in which the shim read them. Lines from the same stream keep their order.
+- **The log file holds exactly these lines** on the worker and on the master. The API serves them unchanged; the CLI and the TUI format them.
+
+### On the worker: the spool
+
+- The spool is the `log` file in the attempt's journal directory (see "Surviving a worker restart"). The shim appends to it; the worker reads it and ships it.
+- **Limit:** `log_spool_max` (1 GB by default). The shim writes a line only if the file stays within the limit. The first line that would exceed it is replaced by one `S` line, `the output is over log_spool_max: the rest is dropped`, and every later line of the attempt is discarded. The file is therefore at most `log_spool_max` plus that one line. The task itself keeps running.
+- The file is deleted when the master has acknowledged every byte of it and the attempt has ended.
+
+### Shipping
+
+- **Chunks** travel on the `Logs` stream: run, task, attempt, DAG, the byte offset of the chunk, at most 64 KiB of data, and a `last` flag. The worker has at most one unacknowledged chunk per attempt.
+- **Acknowledgement:** the master answers each chunk with the number of bytes of that attempt it holds. A chunk is appended only if its offset equals that number; otherwise it is ignored and the worker continues from the number it is told. No byte is written twice or skipped.
+- **While the master is unreachable** the spool keeps growing on the worker. The worker reopens the stream every 2 seconds and, once it is open, resends from the last acknowledged byte. After a master restart the master reads how many bytes it has from its files on disk.
+- **The outcome follows the log.** The worker sends `Report` only after the master has acknowledged the last chunk, which carries `last`. The master therefore saves the outcome when the log is already complete.
+- A chunk for an attempt whose log is already closed is acknowledged and discarded.
+
+### On the master
+
+- **Path:** `[logs] dir`, by default `<data_dir>/logs`, then `<dag>/<run id>/<task>/<attempt>.log`, for example `logs/etl/0192f3a4-…/clean/2.log`.
+- **While the attempt runs** the file is `<attempt>.part`. When the last chunk arrives, or when the attempt ends without it (the worker was lost), the file is renamed to `<attempt>.log`. An attempt that printed nothing still has an empty `.log`.
+- **Limit:** `[logs] max_per_attempt` (100 MB by default). The first half of the limit is kept as the beginning of the log; after that the master keeps only the most recent output, between half and the whole of the limit, in two rotating `.tail` files. When the log is closed the kept end, cut to start at a line boundary, is appended to the beginning after a line `[lwwo: log over the limit, middle part dropped]`. The closed log is therefore at most about `max_per_attempt` long.
+- **Recorded with the attempt:** the size of the closed log in `task_attempts.log_bytes`, and whether it was cut in `log_truncated`.
+- **Deletion:** the directory of a run is deleted with the run, when it is older than `retention` (30 days by default). There is no other cleanup.
+- **Not compressed:** a plain file can be read from any offset without decoding what precedes it.
+
+### Reading
+
+- **API:** `GET /runs/<id>/tasks/<task>/logs`, with `attempt=<n>` (default: the latest attempt) and `follow=true`. The response is `text/plain` in the line format above, and the header `x-lwwo-attempt` gives the attempt served.
+- **Pieces:** the master reads at most 4 MB at a time from the file and sends it, then reads on from where it stopped, so a large log is never held in memory.
+- **Follow:** with `follow=true` the response stays open while the attempt runs, and new output is sent as it arrives. It ends when the log is closed, or when the attempt has ended without a closed log.
+- **Over the limit while following:** once an attempt has written more than half of `max_per_attempt`, the live output stops at that point; the kept end appears when the attempt ends and the log is closed.
+- **CLI:** `lwwo logs` prints each line as `HH:MM:SS  text`, in the time zone of the machine running the CLI, with `ERR ` before stderr lines and `lwwo: ` before lwwo's own lines.
+- **TUI:** `tab` cycles between all lines, stdout with lwwo's lines, and stderr only; `e` toggles stderr only. stderr is red and lwwo's lines cyan; `[` and `]` switch between attempts.
 
 ## Alerts
 
@@ -968,184 +998,3 @@ The core has none. The binary uses:
 - **The end-to-end tests** start real `lwwo` processes on free ports. The scheduling test waits for the next minute, so the suite takes up to about a minute.
 - **Linux-only parts.** timerfd and cgroups exist only on Linux: the same tests are run there in a container, and the cgroup test in a privileged one.
 - **Separate machines.** A further test runs master, two workers and a client in separate containers on a Docker network.
-
-## Status
-
-The project is implemented: both crates exist and work end to end. It has not yet been used in production.
-
-| Part | Status |
-| --- | --- |
-| Core (`lwwo-core`) | complete: graph, runs, retries, queue, worker selection, cron and time zones, timetable, engine, restore and rerun |
-| Master | complete: event loop, timer, SQLite, HTTP API, gRPC, logs |
-| Worker | complete: on-disk journal and one shim per task, processes, containers (Docker, Podman), git source, cgroups, log shipping |
-| Security | complete: internal CA, tokens, mTLS, revocation, certificate renewal |
-| CLI and TUI | complete; the TUI also has a demo mode and its own tests |
-| Alerts | webhook for waiting tasks and failed runs |
-| Map and loop, metrics | not started: see "Open and postponed" |
-
-Verification:
-
-- **Unit tests:** 157 in the core and 78 in the binary, 11 of which drive the TUI key by key.
-- **Simulations:** a week of hourly runs on unreliable workers, about one second each, reproducible for a given seed.
-- **End-to-end tests with real processes** (19): retries and logs; rerun; cancel and timeout on the whole process tree; queued runs; scheduling; joining with a token; a lost worker; a master restart and a worker restart with no task run again; a killed shim; orphaned tasks stopped; a second master refused; alerts received by a local webhook; a DAG corrupted in the database that does not stop the master; a second worker on the same directory refused; revoked and expired tokens; a worker name that cannot be taken over; online backup; certificate renewal; a watched DAG directory.
-- **Linux in a container:** the same tests, plus timerfd and cgroups, which do not exist on macOS.
-- **Separate machines:** master, two workers and a client in separate containers on a Docker network: joining with a token, a worker cut off from the network, a master restart.
-
-Measurements on the release binary, on a laptop:
-
-| Measure | Value |
-| --- | --- |
-| Size of the binary | 17 MB |
-| Master and worker at rest | 10 MB of memory, 0% CPU |
-| 1,000 independent empty tasks on 16 slots | 16 s, about 60 tasks per second |
-| A chain of 300 empty tasks | 76 s, about 250 ms per task: the interval at which the worker polls the shim's files (see "To fix") |
-| Memory after those 1,300 tasks | 21 MB |
-
-The points where the implementation still differs from this document are listed under "Open and postponed".
-
-## Decisions
-
-Each decision is listed with the alternative that was rejected.
-
-| Topic | Decision | Rejected |
-| --- | --- | --- |
-| Language | Rust, a single binary `lwwo` | a mixed stack |
-| Code structure | a core with no I/O in its own crate, plus the program | logic interleaved with database and network code |
-| Repository | one repository, a Cargo workspace with two crates, lint rules that guard the core | one repository per crate; a single crate |
-| Database | SQLite in WAL mode, with the master as the only writer | Postgres or Redis in the first version |
-| Database schema | eight tables; current state in `task_runs`, history in `task_attempts`; the graph rebuilt from the YAML when a run starts; a direct reference to the DAG in task rows | a compiled graph stored in the database |
-| Scheduling | the timetable only in the database, queried at each scheduled time; a single timerfd alarm armed on the next instant | a loop that polls the database; the whole timetable in memory |
-| Overlap | a per-DAG policy: `queue` (default), `skip`, `allow`, `replace` | one fixed policy |
-| Catch-up | `catchup` as in Airflow 3, `false` by default | always catching up everything |
-| Manual runs | `lwwo run` with `--at` and `--param`; past days with a loop of manual runs | a backfill command and table |
-| Parameters | declared in the DAG, each with a default; unknown names rejected | free, undeclared parameters |
-| Rerun | in the same run, with new attempts and the run's DAG version | a new run for every rerun |
-| Dispatch | the master pushes on a stream opened by the worker | workers that poll the master |
-| Resources | slots and labels | memory-based scheduling with Kubernetes-style classes |
-| Graph | in memory only for DAGs with open runs, built from the YAML when a run starts | edges stored per run; a graph database |
-| Transport | gRPC between worker and master; HTTP/JSON for CLI and TUI | WebSocket |
-| DAG definition | YAML loaded with `lwwo apply`, versions identified by hash | a watched directory as the primary source |
-| Tasks | a process or a container, with code from the image or from git | Python files distributed to every worker, as in Airflow |
-| Data between tasks | none: only the identity of the run, in `LWWO_*` variables | a manifest or XCom stored by the master |
-| Secrets | not managed: provided by the user's existing secret service | secrets stored on the master or the workers |
-| Logs | on the master, one file per attempt, streamed live to the TUI | logs kept only on the worker |
-| Configuration | a TOML file, overridable by environment variables and flags | flags only |
-| Worker enrolment | a token and an internal CA, as in Docker Swarm | manually managed certificates |
-| Interface | a terminal UI in the style of k9s, in the same binary | a web UI |
-| Task failure | only its successors are skipped and independent branches continue, like Airflow's `all_success` rule; stopping the whole run may become a per-DAG option | always stopping the whole run |
-| Run identity in the core | `RunId(u128)`: the UUIDv7 as a 128-bit number, generated by the binary with the `uuid` crate and stored as text; the core stays free of dependencies | the `uuid` crate inside the core |
-| Worker selection | among the workers that accept tasks and have the labels and the free slots, the one that is proportionally least loaded after the assignment, like `LeastAllocated` in Kubernetes; ties are broken round-robin by id, because the core uses no random numbers | the first worker with room; random choice among equals |
-| Pausing a DAG | removes its timetable row; resuming recreates it from the next occurrence after the current time, and occurrences during the pause are not caught up, which keeps the two queries simple | keeping the row and skipping paused DAGs at every scheduled time |
-| Cron and time zones | the cron parser and the computation of the next occurrence in local time are implemented in the core, without dependencies; the binary converts between local time and UTC with a crate that reads the IANA time zone database | a cron crate; hand-written time zones |
-| Daylight saving | a scheduled time that does not exist, such as 02:30 on the day clocks go forward, runs at the first valid instant after it; one that occurs twice runs only the first time | skipping the day; running twice |
-| Default retries | zero: a failed task stays failed unless the DAG sets `retries`; the delay starts at `retry_delay` (30 seconds) and by default doubles at each attempt, up to `max_retry_delay` when set | retrying a few times by default |
-| Timeout and retries | the worker measures the timeout: it receives the duration in `Assign`, stops the process and reports `timeout`, even while the master is down. The master decides retries, so a retry can go to another worker and holds no slot while it waits | a timeout measured by the master and enforced with `Cancel`; retries on the worker, always on the same machine |
-| Certificate lifetime | 90 days for workers, renewed automatically at two thirds; one valid certificate per worker | certificates without expiry; a revocation list |
-| YAML | serde\_yaml\_ng, confined to the `dsl` module | serde\_yaml, no longer maintained |
-| Time zones in the binary | jiff, which reads the system's IANA database and bundles a copy | hand-written time zones |
-| Error types | hand-written types in the core; anyhow in the binary, with messages that state the remedy | thiserror in the core |
-| Templates | resolved by the master; `Assign` carries the final command and environment | templates resolved by the worker |
-| Executors | modelled as internal labels: a task with an image is placed only where Docker or Podman is available | a separate check in the master |
-| Log shipping | a stream with an acknowledgement per chunk; the outcome is sent after the log | logs shipped without acknowledgement |
-| Waiting manual runs | the `queued` state in `dag_runs`; scheduled occurrences wait in the timetable instead | a single queue for both |
-| First access | an API token written to `admin.token` on first start; the join token reprintable from `join.token` | tokens shown only once |
-| Process tree | a cgroup per task, which the task enters before it starts; without cgroups, the process group | the process group only |
-| Rust version | pinned in `rust-toolchain.toml` | the latest stable on each machine |
-| Licence | MIT | MIT and Apache-2.0 together |
-| Single master | one master per data directory, enforced by a file lock; a supervisor restarts it, and loss of the machine is covered by replicating SQLite | several active masters over Postgres; active and standby with an external arbiter |
-| Worker restart | an on-disk journal written before acting, and a shim per task: the worker can stop and restart without affecting tasks; a shim whose worker is gone stops its task after `heartbeat_timeout` | tasks as children of the worker, lost with it; stopping tasks whenever the worker stops |
-| Alerts | a single channel, a webhook receiving a JSON POST, off by default; it reports tasks that wait too long and failed runs, once each, without storing them | commands or scripts launched by the master; per-service integrations; a deadline that fails waiting tasks; rejecting on apply labels that no worker has |
-| Error containment | an error stops only the run or the DAG it concerns, and the reason is recorded; the master stops only when it cannot write to the database. No panic on input, and no caught panics | letting the master crash and be restarted; catching panics and continuing |
-| Tokens and identity | API tokens that can be revoked and can expire; a worker name cannot be claimed with the join token alone; the join token is never a flag | token roles; taking over a name after an absence |
-| cgroups | `auto`: a cgroup per task only when the worker has its cgroup to itself | always moving the other processes; cgroups only on request |
-| Plain-text logs | text files, streamable from any offset, removed by `retention` | compressing them when the task ends: less disk, but a compressed file cannot be read from the middle |
-| TUI design | three layers (data, state, drawing), so that tests can press keys without a terminal; a k9s and Game Boy look, with a message box and a full graph | plain ratatui tables with state and drawing combined |
-
-## Alternatives considered
-
-The options that were considered and rejected, with the reason and the condition for reconsidering each.
-
-### Comparable systems
-
-| Tool | How work is assigned | Where the graph is stored |
-| --- | --- | --- |
-| Airflow | the scheduler polls the database in a loop and recounts the states of upstream tasks | DAGs serialized as JSON in the database; versioned since 3, identified by hash |
-| Dagster | the run's process follows the job's plan in memory | snapshots serialized in the instance storage, SQLite by default |
-| Prefect | the flow's Python code, as it runs | no static graph: each task run records where its inputs come from |
-| Dagu | workers poll the coordinator over gRPC, with long polling | YAML files |
-| Hatchet | push on a bidirectional gRPC connection opened by the worker | Postgres |
-| Windmill | workers take jobs from a queue in Postgres | Postgres |
-
-### Rejected options
-
-| Alternative | Reason for rejection | When to reconsider |
-| --- | --- | --- |
-| A master that polls the database in a loop | it always adds the delay of the interval, and queries even when there is no work | never |
-| Redis for state and queues | one more service to install and operate | with several masters sharing state |
-| The whole timetable in memory | a second copy to keep consistent with the database, and unnecessary: the two queries per scheduled time cost a few microseconds | if those queries become a visible cost |
-| Memory-based scheduling with Kubernetes-style classes (guaranteed, burstable, best effort) | it turns the orchestrator into a small Kubernetes, and the memory a task needs is not known in advance | if required, a Kubernetes executor is the better answer |
-| A graph database | the engine's graphs are small and traversed in nanoseconds; a second database breaks the single transaction | for lineage |
-| WebSocket between worker and master | it is only a pipe: message format, versioning and separate flows would have to be built by hand | never, for workers |
-| A compiled graph stored in the database | rebuilding it from the YAML costs 44 µs per 1,000 tasks, once per run | if very large DAGs that run often make it a visible cost |
-| A backfill command and table | a loop of manual runs with `--at` is sufficient | if such loops prove impractical |
-| Data passing between tasks, with a manifest or XCom | task data would pass through the master and be stored by it | small outputs for map and loop |
-| Secrets managed by the orchestrator | the user's existing secret service already provides them | never |
-| Tables for tasks and dependencies | the definition is already in the YAML of the version | for queries on the structure of DAGs |
-| Built-in Raft among three masters | not required with a single master; the deterministic core with no I/O makes it feasible, since masters that apply the same log of events reach the same state | when surviving the loss of the machine without human intervention is required |
-| A database lease for a standby master | with SQLite on a local disk a takeover makes sense only on the same machine, where a restart is sufficient | together with Raft, or with shared state |
-| A web UI | the TUI works over SSH and needs no frontend | if non-technical users need access |
-
-## Open and postponed
-
-### To fix
-
-Points where the implementation does less than this document states.
-
-- [ ] **Skipped occurrences:** with `overlap: skip` the skipped occurrence appears only in the master's log. The schema has no place to record it; a column or an additional state is needed.
-- [ ] **Queued reruns:** while another run is active a rerun is refused instead of waiting.
-- [ ] **`log_spool_max` keeps the beginning:** beyond the limit the worker drops the end of the output, which usually contains the errors. Keeping both ends, as the master does, requires shipping from a rotating file.
-- [ ] **Master epoch:** a number that increases at every start and is sent to the workers would let them refuse the orders of a stale master. It is postponed together with high availability, since after a restore from backup the number would go backwards.
-- [ ] **Token roles:** every API token currently grants full access. A read-only token belongs to the postponed topic of users and permissions.
-- [ ] **systemd executor:** on Linux with systemd the guardian of a task could be process 1, which never dies (`systemd-run`); at present the shim is always used.
-- [ ] **Custom API certificate:** the master serves it, but CLI and TUI can verify only the internal CA.
-- [ ] **Retries after a restart:** a task requeued after a master restart may have fewer retries left than it should, because the database does not record when it was requeued.
-- [ ] **Peak memory** is available only with cgroups, hence only on Linux and with permission to create them.
-- [ ] **Scheduling test:** it failed once and the failure was not reproduced. The likely cause is the port collision between parallel tests that was fixed later; this is not proven.
-- [ ] **Live TUI:** the live log and the graph are verified only on demo data, not yet against a real master.
-- [ ] **Interrupted renewal:** if the worker stops between the master's response to `Renew` and saving the new certificate, its old certificate is no longer valid and it must join again after `lwwo worker remove`. The master could accept the previous certificate until the new one is first used.
-- [ ] **Fixed latency per task:** the worker polls the shim's files every 250 ms, which adds about that much to every task. A chain of 300 empty tasks takes 76 s, and 1,000 parallel ones on 16 slots take 16 s. The overhead is negligible for tasks that last minutes.
-- [ ] **A worker cut off from the network keeps its tasks** (see "Surviving a worker restart"). Stopping them after `heartbeat_timeout` without contact with the master would also stop every task whenever the master is down for longer than that.
-
-### Postponed
-
-- [ ] Map and loop for agentic workflows. The implementation comes later, but the engine must account from the start for a graph that grows during the run.
-- [ ] Required parameters, without a default.
-- [ ] A compiled graph stored in the database, or a cache of the graphs of frequently scheduled DAGs: only if building from the YAML becomes a visible cost.
-- [ ] Triggers between DAGs: B starts when A ends.
-- [ ] Metrics for Prometheus.
-- [ ] Users and permissions for CLI and TUI.
-- [ ] Logs on S3 instead of the master's disk.
-- [ ] Memory-based scheduling, with evictions and task classes.
-- [ ] Lineage between DAGs and data, with SQLite's recursive queries or GraphQLite on the same file.
-- [ ] Fail-fast runs: stopping a run at its first failure, as a per-DAG option.
-- [ ] Replaying a run step by step from the stored events of the core.
-- [ ] Simulating future runs with the core, a simulated clock and historical durations.
-- [ ] Reusable tasks, defined once and referenced from several DAGs.
-- [ ] Releases: static binaries for Linux x86\_64 and arm64, and a Docker image.
-
-## Sources
-
-- [Dagu](https://github.com/dagucloud/dagu)
-- [Hatchet: architecture and guarantees](https://docs.hatchet.run/v1/architecture-and-guarantees)
-- [Deploying Windmill (PandaStack)](https://pandastack.io/blog/deploy-windmill-automation)
-- [Airflow: DAG serialization](https://airflow.apache.org/docs/apache-airflow/3.1.0/administration-and-deployment/dag-serialization.html)
-- [Airflow: upgrading to Airflow 3](https://airflow.apache.org/docs/apache-airflow/3.0.1/installation/upgrading_to_airflow3.html)
-- [Airflow Summit 2021: slides on the Airflow 2 scheduler](https://airflowsummit.org/slides/2021/d2-Scheduler.pdf)
-- [Airflow 1.10: source of trigger\_rule\_dep](https://airflow.apache.org/docs/apache-airflow/1.10.3/_modules/airflow/ti_deps/deps/trigger_rule_dep.html)
-- [Airflow 3.0: DAG versioning (The Data Canal)](https://thedatacanal.substack.com/p/airflow-30-dag-versioning-multi-language)
-- [Dagster: instance configuration](https://dagster.io/docs/deployment/oss/oss-instance-configuration)
-- [Prefect: visualize flow structure](https://docs.prefect.io/3.0/resources/visualize-flow-structure)
-- [Prefect: create task run API](https://docs.prefect.io/v3/api-ref/rest-api/server/task-runs/create-task-run)
-- [Ballista: scheduler configuration](https://deepwiki.com/apache/datafusion-ballista/5.2-scheduler-configuration)
-- [Nextflow: 5 more tips for HPC](https://nextflow.io/blog/2021/5-more-tips-for-nextflow-user-on-hpc.html)
-- [GraphQLite](https://docs.rs/graphqlite)
