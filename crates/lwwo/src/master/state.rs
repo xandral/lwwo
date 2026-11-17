@@ -27,7 +27,7 @@ use tracing::{error, info, warn};
 use super::alerts::{self, Webhook};
 use super::logs::{LogKey, LogStore};
 use crate::config::MasterConfig;
-use crate::dsl::{CONTAINER_LABEL, Dag, PROCESS_LABEL, RunContext};
+use crate::dsl::{Dag, RunContext};
 use crate::proto;
 use crate::security::{Ca, Token, TokenKind};
 use crate::store::{AttemptEnd, RunRow, Store};
@@ -210,7 +210,6 @@ struct Session {
     /// ignored.
     number: u64,
     tx: mpsc::Sender<proto::MasterMessage>,
-    executors: Vec<String>,
     total_memory: u64,
     available_memory: u64,
     free_disk: u64,
@@ -1242,19 +1241,7 @@ impl Master {
                 None => unknown.push(task),
             }
         }
-        // Executors are placed like labels: a task with an image needs a
-        // worker that runs containers.
-        let mut labels = hello.labels;
-        if hello.executors.iter().any(|e| e == "process") {
-            labels.push(PROCESS_LABEL.to_owned());
-        }
-        if hello
-            .executors
-            .iter()
-            .any(|e| e == "docker" || e == "podman")
-        {
-            labels.push(CONTAINER_LABEL.to_owned());
-        }
+        let labels = hello.labels;
         let now_ms = now_ms();
         info!(
             "worker {name} connected: {} slots, {} tasks in flight",
@@ -1266,7 +1253,6 @@ impl Master {
             Session {
                 number: session,
                 tx,
-                executors: hello.executors,
                 total_memory: hello.total_memory,
                 available_memory: 0,
                 free_disk: 0,
@@ -1700,7 +1686,6 @@ impl Master {
                         "waiting": waiting,
                         "needs": def.needs,
                         "command": def.run,
-                        "image": def.image,
                         // A queued run has no task rows yet.
                         "state": saved.map_or("blocked", |t| t.state.as_str()),
                         "attempts": saved.map_or(0, |t| t.attempts),
@@ -1871,18 +1856,13 @@ impl Master {
             .iter()
             .filter_map(|(id, worker)| {
                 let session = self.sessions.get(&id)?;
-                let labels: Vec<&String> = worker
-                    .labels()
-                    .iter()
-                    .filter(|label| !label.starts_with("lwwo:"))
-                    .collect();
+                let labels = worker.labels();
                 Some(json!({
                     "name": self.worker_name(id),
                     "slots": worker.slots(),
                     "used": worker.used(),
                     "accepting": worker.accepting(),
                     "labels": labels,
-                    "executors": session.executors,
                     "total_memory": session.total_memory,
                     "available_memory": session.available_memory,
                     "free_disk": session.free_disk,
@@ -2165,26 +2145,17 @@ fn contain(result: Result<()>, what: &str) -> Result<()> {
 fn blocker_text(blocker: &Blocker) -> String {
     match blocker {
         Blocker::NoWorkers => "no worker is connected".to_owned(),
-        Blocker::MissingLabels(labels) => {
-            // Executors are placed like labels: say what they mean.
-            if labels.iter().any(|label| label == CONTAINER_LABEL) {
-                return "no connected worker runs containers (docker or podman)".to_owned();
-            }
-            if labels.iter().any(|label| label == PROCESS_LABEL) {
-                return "no connected worker runs processes on the host".to_owned();
-            }
-            match labels.as_slice() {
-                [label] => format!("no connected worker has the label \"{label}\""),
-                labels => format!(
-                    "no connected worker has all the labels {}",
-                    labels
-                        .iter()
-                        .map(|label| format!("\"{label}\""))
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                ),
-            }
-        }
+        Blocker::MissingLabels(labels) => match labels.as_slice() {
+            [label] => format!("no connected worker has the label \"{label}\""),
+            labels => format!(
+                "no connected worker has all the labels {}",
+                labels
+                    .iter()
+                    .map(|label| format!("\"{label}\""))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        },
         Blocker::TooFewSlots { needed, largest } => {
             format!("it needs {needed} slots and the largest worker that fits has {largest}")
         }
@@ -2223,13 +2194,6 @@ fn assignment(
         dag: open.dag.clone(),
         command: rendered.command,
         env: rendered.env.into_iter().collect(),
-        image: def.image.clone(),
-        source: def.source.as_ref().map(|source| proto::GitSource {
-            git: source.git.clone(),
-            r#ref: source.reference.clone(),
-        }),
-        pass_env: def.pass_env.clone(),
-        volumes: def.volumes.clone(),
         timeout_ms: timeout.map(|t| u64::try_from(t.as_millis()).unwrap_or(u64::MAX)),
         slots: def.slots,
     })

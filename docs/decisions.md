@@ -22,7 +22,7 @@ Why lwwo is built the way it is. Each decision is listed with the alternative th
 | Graph | in memory only for DAGs with open runs, built from the YAML when a run starts | edges stored per run; a graph database |
 | Transport | gRPC between worker and master; HTTP/JSON for CLI and TUI | WebSocket |
 | DAG definition | YAML loaded with `lwwo apply`, versions identified by hash | a watched directory as the primary source |
-| Tasks | a process or a container, with code from the image or from git | Python files distributed to every worker, as in Airflow |
+| Tasks | a command run as a process on the worker's host; containers and code checkouts belong to the command | Python files distributed to every worker, as in Airflow; built-in container and git executors (removed: incomplete, untested, and the task's own command does the same) |
 | Data between tasks | none: only the identity of the run, in `LWWO_*` variables | a manifest or XCom stored by the master |
 | Secrets | not managed: provided by the user's existing secret service | secrets stored on the master or the workers |
 | Logs | on the master, one file per attempt, streamed live to the TUI | logs kept only on the worker |
@@ -42,7 +42,6 @@ Why lwwo is built the way it is. Each decision is listed with the alternative th
 | Time zones in the binary | jiff, which reads the system's IANA database and bundles a copy | hand-written time zones |
 | Error types | hand-written types in the core; anyhow in the binary, with messages that state the remedy | thiserror in the core |
 | Templates | resolved by the master; `Assign` carries the final command and environment | templates resolved by the worker |
-| Executors | modelled as internal labels: a task with an image is placed only where Docker or Podman is available | a separate check in the master |
 | Log shipping | a stream with an acknowledgement per chunk; the outcome is sent after the log | logs shipped without acknowledgement |
 | Waiting manual runs | the `queued` state in `dag_runs`; scheduled occurrences wait in the timetable instead | a single queue for both |
 | First access | an API token written to `admin.token` on first start; the join token reprintable from `join.token` | tokens shown only once |

@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, ensure};
 use rustix::process::{Pid, Signal, kill_process_group};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
@@ -24,7 +24,7 @@ use tokio::sync::{mpsc, watch};
 
 use super::cgroup::Cgroup;
 use super::journal::{self, Exit, Spec, Started};
-use crate::util::{now_ms, sha256_hex};
+use crate::util::now_ms;
 
 /// How often the shim looks for a request to stop.
 const LOOK_EVERY: Duration = Duration::from_millis(300);
@@ -75,190 +75,33 @@ async fn copy_lines(pipe: impl AsyncRead + Unpin, stream: char, output: Output) 
     }
 }
 
-async fn git(args: &[&str], output: Option<&Output>) -> Result<()> {
-    let result = Command::new("git")
-        .args(args)
-        .stdin(Stdio::null())
-        .env("GIT_TERMINAL_PROMPT", "0")
-        // If the attempt is stopped while git runs, git goes with it.
-        .kill_on_drop(true)
-        .output()
-        .await
-        .context("cannot run git: is it installed on the worker?")?;
-    if !result.status.success() {
-        if let Some(output) = output {
-            for line in String::from_utf8_lossy(&result.stderr).lines() {
-                output.system(&format!("git: {line}"));
-            }
-        }
-        bail!("git {} failed", args.first().copied().unwrap_or_default());
-    }
-    Ok(())
-}
-
-fn dir_size(path: &Path) -> u64 {
-    let Ok(entries) = std::fs::read_dir(path) else {
-        return 0;
-    };
-    entries
-        .flatten()
-        .map(|entry| match entry.metadata() {
-            Ok(meta) if meta.is_dir() => dir_size(&entry.path()),
-            Ok(meta) => meta.len(),
-            Err(_) => 0,
-        })
-        .sum()
-}
-
-/// Removes the least recently used repositories until the cache fits.
-fn evict(cache: &Path, max: u64) {
-    let Ok(entries) = std::fs::read_dir(cache) else {
-        return;
-    };
-    let mut repos: Vec<(std::time::SystemTime, u64, PathBuf)> = entries
-        .flatten()
-        .filter_map(|entry| {
-            let used = std::fs::metadata(entry.path().join("lwwo-used"))
-                .ok()?
-                .modified()
-                .ok()?;
-            Some((used, dir_size(&entry.path()), entry.path()))
-        })
-        .collect();
-    repos.sort();
-    let mut total: u64 = repos.iter().map(|(_, size, _)| size).sum();
-    // The newest one was just used: it stays whatever its size.
-    repos.pop();
-    for (_, size, path) in repos {
-        if total <= max {
-            break;
-        }
-        if std::fs::remove_dir_all(&path).is_ok() {
-            total -= size;
-        }
-    }
-}
-
-/// Puts the repository of the task in its working directory, through a
-/// cached mirror so that only what changed is downloaded.
-async fn checkout(spec: &Spec, git_url: &str, reference: &str, output: &Output) -> Result<()> {
-    std::fs::create_dir_all(&spec.cache_dir)?;
-    let id = &sha256_hex(git_url.as_bytes())[..16];
-    let mirror = spec.cache_dir.join(id);
-    let mirror_text = mirror.to_string_lossy().into_owned();
-    let workdir_text = spec.workdir.to_string_lossy().into_owned();
-    {
-        // One shim at a time on a mirror: each attempt is a process of
-        // its own, so the lock is a file.
-        let lock_path = spec.cache_dir.join(format!("{id}.lock"));
-        let lock = tokio::task::spawn_blocking(move || -> Result<std::fs::File> {
-            let file = std::fs::File::create(lock_path)?;
-            rustix::fs::flock(&file, rustix::fs::FlockOperation::LockExclusive)?;
-            Ok(file)
-        })
-        .await??;
-        if mirror.join("HEAD").exists() {
-            let update = ["--git-dir", &mirror_text, "remote", "update", "--prune"];
-            git(&update, Some(output)).await?;
-        } else {
-            output.system(&format!("cloning {git_url}"));
-            let clone = ["clone", "--quiet", "--mirror", git_url, &mirror_text];
-            git(&clone, Some(output)).await?;
-        }
-        std::fs::write(mirror.join("lwwo-used"), "")?;
-        drop(lock);
-    }
-    let clone = [
-        "clone",
-        "--quiet",
-        "--no-checkout",
-        &mirror_text,
-        &workdir_text,
-    ];
-    git(&clone, Some(output)).await?;
-    // A branch of the mirror is a remote branch of the clone.
-    let remote_branch = format!("origin/{reference}");
-    let detach = ["-C", &workdir_text, "checkout", "--quiet", "--detach"];
-    if git(&[&detach[..], &[&remote_branch]].concat(), None)
-        .await
-        .is_err()
-    {
-        git(&[&detach[..], &[reference]].concat(), Some(output))
-            .await
-            .with_context(|| {
-                format!("`{reference}` is not a branch, tag or commit of {git_url}")
-            })?;
-    }
-    let (cache, max) = (spec.cache_dir.clone(), spec.cache_max);
-    tokio::task::spawn_blocking(move || evict(&cache, max));
-    Ok(())
-}
-
-/// Which program runs containers on this worker.
-fn container_runtime(spec: &Spec) -> Option<&str> {
-    spec.executors
-        .iter()
-        .map(String::as_str)
-        .find(|executor| matches!(*executor, "docker" | "podman"))
-}
-
-/// The command that starts the task.
+/// The command that starts the task: a process on the worker's host.
 fn command(spec: &Spec, cgroup: &Cgroup) -> Result<Command> {
     ensure!(!spec.command.is_empty(), "the task has no command");
-    let Some(image) = &spec.image else {
-        ensure!(
-            spec.executors.iter().any(|e| e == "process"),
-            "this worker does not run processes on the host"
-        );
-        // The task enters its cgroup before it becomes the task: a shell
-        // writes its own pid there and then turns into the command, so
-        // nothing the task starts can be outside.
-        let mut command = if let Some(procs) = cgroup.procs() {
-            let mut shell = Command::new("/bin/sh");
-            shell
-                .args(["-c", "echo $$ > \"$0\"; exec \"$@\""])
-                .arg(procs)
-                .args(&spec.command);
-            shell
-        } else {
-            let mut command = Command::new(&spec.command[0]);
-            command.args(&spec.command[1..]);
-            command
-        };
-        command.current_dir(&spec.workdir);
-        // The task inherits the worker's environment, except lwwo's own
-        // variables: its configuration, token included, is not for tasks.
-        for (variable, _) in std::env::vars_os() {
-            if variable.to_string_lossy().starts_with("LWWO_") {
-                command.env_remove(variable);
-            }
-        }
-        command.envs(&spec.env).env("LWWO_WORKDIR", &spec.workdir);
-        return Ok(command);
+    // The task enters its cgroup before it becomes the task: a shell
+    // writes its own pid there and then turns into the command, so
+    // nothing the task starts can be outside.
+    let mut command = if let Some(procs) = cgroup.procs() {
+        let mut shell = Command::new("/bin/sh");
+        shell
+            .args(["-c", "echo $$ > \"$0\"; exec \"$@\""])
+            .arg(procs)
+            .args(&spec.command);
+        shell
+    } else {
+        let mut command = Command::new(&spec.command[0]);
+        command.args(&spec.command[1..]);
+        command
     };
-    let runtime = container_runtime(spec).context("this worker does not run containers")?;
-    let mut command = Command::new(runtime);
-    let name = format!("lwwo-{}", spec.name());
-    command.args(["run", "--rm", "--name", &name, "--workdir", "/work"]);
-    command
-        .arg("--volume")
-        .arg(format!("{}:/work", spec.workdir.display()));
-    // In a container only what is listed gets in.
-    for (variable, value) in &spec.env {
-        command.arg("--env").arg(format!("{variable}={value}"));
+    command.current_dir(&spec.workdir);
+    // The task inherits the worker's environment, except lwwo's own
+    // variables: its configuration, token included, is not for tasks.
+    for (variable, _) in std::env::vars_os() {
+        if variable.to_string_lossy().starts_with("LWWO_") {
+            command.env_remove(variable);
+        }
     }
-    command.args(["--env", "LWWO_WORKDIR=/work"]);
-    for variable in &spec.pass_env {
-        ensure!(
-            !variable.starts_with("LWWO_"),
-            "`{variable}` cannot be passed to a task"
-        );
-        command.arg("--env").arg(variable);
-    }
-    for volume in &spec.volumes {
-        command.arg("--volume").arg(volume);
-    }
-    command.arg(image).args(&spec.command);
+    command.envs(&spec.env).env("LWWO_WORKDIR", &spec.workdir);
     Ok(command)
 }
 
@@ -269,7 +112,6 @@ async fn stop(spec: &Spec, child: &mut Child, cgroup: &Cgroup) {
         .id()
         .and_then(|pid| Pid::from_raw(i32::try_from(pid).ok()?));
     if let Some(group) = group {
-        // For a container this reaches the client, which passes it on.
         let _ = kill_process_group(group, Signal::TERM);
     }
     let grace = Duration::from_millis(spec.kill_grace_ms);
@@ -277,7 +119,6 @@ async fn stop(spec: &Spec, child: &mut Child, cgroup: &Cgroup) {
         cgroup.kill();
         return;
     }
-    kill_container(spec).await;
     if let Some(group) = group {
         let _ = kill_process_group(group, Signal::KILL);
     }
@@ -286,13 +127,6 @@ async fn stop(spec: &Spec, child: &mut Child, cgroup: &Cgroup) {
 }
 
 /// Kills the container of the attempt, if the task runs in one.
-pub(crate) async fn kill_container(spec: &Spec) {
-    if let (Some(_), Some(runtime)) = (&spec.image, container_runtime(spec)) {
-        let name = format!("lwwo-{}", spec.name());
-        let _ = Command::new(runtime).args(["kill", &name]).output().await;
-    }
-}
-
 /// Decides when the task must be stopped, and says so on `stop`.
 async fn watch_for_stop(
     spec: Spec,
@@ -394,19 +228,7 @@ async fn attempt(
             spec.workdir.display()
         )
     })?;
-    if let Some((git_url, reference)) = &spec.source {
-        // Preparing can be stopped like running: dropping the checkout
-        // kills the git it started.
-        tokio::select! {
-            fetched = checkout(spec, git_url, reference, output) => fetched?,
-            reason = stopped(stop_rx) => return Ok(End::stopped(reason, output)),
-        }
-    }
-    // A container has the cgroup its runtime gives it.
-    let cgroup = match spec.image {
-        Some(_) => Cgroup::none(),
-        None => Cgroup::at(spec.cgroup_base.as_deref(), &spec.name()),
-    };
+    let cgroup = Cgroup::at(spec.cgroup_base.as_deref(), &spec.name());
     let spawned = command(spec, &cgroup).and_then(|mut command| {
         command
             .stdin(Stdio::null())

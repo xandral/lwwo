@@ -294,10 +294,7 @@ pub(crate) struct WorkerConfig {
     pub(crate) data_dir: PathBuf,
     pub(crate) slots: Option<u32>,
     pub(crate) labels: Vec<String>,
-    pub(crate) executors: Vec<String>,
     pub(crate) workdir: Option<PathBuf>,
-    pub(crate) cache_dir: Option<PathBuf>,
-    pub(crate) cache_max: Amount,
     pub(crate) min_free_disk: Amount,
     pub(crate) min_free_memory: Amount,
     pub(crate) kill_grace: Dur,
@@ -315,10 +312,7 @@ impl Default for WorkerConfig {
             data_dir: PathBuf::from("/var/lib/lwwo-worker"),
             slots: None,
             labels: Vec::new(),
-            executors: vec!["process".to_owned()],
             workdir: None,
-            cache_dir: None,
-            cache_max: Amount(Size::Bytes(20 << 30)),
             min_free_disk: Amount(Size::Percent(10)),
             min_free_memory: Amount(Size::Percent(10)),
             kill_grace: Dur(Duration::from_secs(30)),
@@ -365,13 +359,6 @@ impl WorkerConfig {
         self.workdir
             .clone()
             .unwrap_or_else(|| self.data_dir.join("work"))
-    }
-
-    /// Where git repositories are cached.
-    pub(crate) fn cache_dir(&self) -> PathBuf {
-        self.cache_dir
-            .clone()
-            .unwrap_or_else(|| self.data_dir.join("cache"))
     }
 }
 
@@ -425,10 +412,7 @@ const WORKER_FIELDS: &[(&str, Kind)] = &[
     ("data_dir", Kind::Text),
     ("slots", Kind::Integer),
     ("labels", Kind::List),
-    ("executors", Kind::List),
     ("workdir", Kind::Text),
-    ("cache_dir", Kind::Text),
-    ("cache_max", Kind::Text),
     ("min_free_disk", Kind::Text),
     ("min_free_memory", Kind::Text),
     ("kill_grace", Kind::Text),

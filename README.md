@@ -74,8 +74,6 @@ in [docs/design.md](docs/design.md).
 - **protoc**, the Protocol Buffers compiler, used during the build:
   `brew install protobuf` on macOS, `apt install protobuf-compiler` on
   Debian and Ubuntu.
-- **Docker or Podman**, only for tasks that run in containers.
-- **git**, only for tasks that take their code from a repository.
 
 lwwo runs on Linux and macOS. Linux is the target platform: waking exactly
 on time when the system clock is changed (timerfd) and stopping every
@@ -175,8 +173,7 @@ tasks:
 
   load:
     needs: [clean]
-    image: ghcr.io/acme/etl:1.4.2
-    run: ["python", "load.py", "--day", "{{ run.date }}"]
+    run: ["docker", "run", "--rm", "ghcr.io/acme/etl:1.4.2", "python", "load.py", "--day", "{{ run.date }}"]
     timeout: 1h
 ```
 
@@ -185,10 +182,11 @@ tasks:
   failure. There is no library to import and no task API: a Python script, a
   compiled program, `dbt` or a shell one-liner (`["sh", "-c", "..."]`) are
   all tasks.
-- **Where it runs.** By default, as a process on the worker. With `image`,
-  in a container, so the worker needs only Docker or Podman. With `source`,
-  the worker first checks out a git repository into the task's working
-  directory.
+- **Where it runs.** As a process on the worker's host, in a private
+  working directory. lwwo does not manage containers or code checkouts:
+  a task that needs them says so in its command, for example
+  `docker run …` or a script that runs `git clone` first, as `load` does
+  above.
 - **Dependencies.** `needs` lists the tasks that must succeed first. lwwo
   derives the order and runs in parallel whatever can be. When a task fails,
   the tasks that depend on it are skipped and independent branches continue.
@@ -353,7 +351,7 @@ assigned only to workers that have it. This is the whole resource model.
   holds a token can run commands on every worker, as the worker's user.
 - Tasks run as the worker's user and are not isolated from each other or
   from the worker: a task can read the worker's key and the files of other
-  tasks. Containers see only what is mounted and passed to them.
+  tasks.
 - `standalone` has no authentication: every process on the machine can use
   its API. It refuses requests coming from web pages. It is meant for trying
   lwwo on a personal machine, not for shared hosts.

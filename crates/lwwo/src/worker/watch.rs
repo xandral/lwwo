@@ -20,7 +20,6 @@ use tracing::warn;
 
 use super::cgroup::Cgroup;
 use super::journal::{self, Exit, Spec, Started};
-use super::shim;
 use super::ship::{Key, Shipper};
 use crate::config::WorkerConfig;
 use crate::proto;
@@ -85,18 +84,8 @@ pub(crate) fn launch(shared: &Shared, assign: &proto::Assign, key: &Key) -> Resu
         dag: assign.dag.clone(),
         command: assign.command.clone(),
         env: assign.env.clone().into_iter().collect(),
-        image: assign.image.clone(),
-        source: assign
-            .source
-            .as_ref()
-            .map(|source| (source.git.clone(), source.r#ref.clone())),
-        pass_env: assign.pass_env.clone(),
-        volumes: assign.volumes.clone(),
         timeout_ms: assign.timeout_ms,
-        executors: config.executors.clone(),
         workdir: journal::attempt_dir(&config.workdir(), key),
-        cache_dir: config.cache_dir(),
-        cache_max: config.cache_max.0.of(u64::MAX),
         kill_grace_ms: u64::try_from(config.kill_grace.0.as_millis()).unwrap_or(u64::MAX),
         cgroup_base: shared.cgroup_base.clone(),
         alive: shared.alive(),
@@ -155,12 +144,9 @@ async fn clean_up_after_shim(shared: &Shared, spec: &Spec, dir: &Path) -> Exit {
     {
         let _ = kill_process_group(group, Signal::KILL);
     }
-    shim::kill_container(spec).await;
-    if spec.image.is_none() {
-        let cgroup = Cgroup::at(shared.cgroup_base.as_deref(), &spec.name());
-        cgroup.kill();
-        cgroup.remove();
-    }
+    let cgroup = Cgroup::at(shared.cgroup_base.as_deref(), &spec.name());
+    cgroup.kill();
+    cgroup.remove();
     let _ = tokio::fs::remove_dir_all(&spec.workdir).await;
     let now = now_ms();
     let exit = Exit {

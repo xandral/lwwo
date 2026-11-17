@@ -10,7 +10,7 @@ The project is implemented: both crates exist and work end to end. It has not ye
 | --- | --- |
 | Core (`lwwo-core`) | complete: graph, runs, retries, queue, worker selection, cron and time zones, timetable, engine, restore and rerun |
 | Master | complete: event loop, timer, SQLite, HTTP API, gRPC, logs |
-| Worker | complete: on-disk journal and one shim per task, processes, containers (Docker, Podman), git source, cgroups, log shipping |
+| Worker | complete: on-disk journal and one shim per task, processes on the host, cgroups, log shipping |
 | Security | complete: internal CA, tokens, mTLS, revocation, certificate renewal |
 | CLI and TUI | complete; the TUI also has a demo mode and its own tests |
 | Alerts | webhook for waiting tasks and failed runs |

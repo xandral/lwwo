@@ -90,7 +90,6 @@ fn task_rows(
             TaskRow {
                 state: TaskState::parse(task["state"].as_str().unwrap_or_default()),
                 command: list(&task[command_field]).join(" "),
-                image: task["image"].as_str().map(str::to_owned),
                 waiting: task["waiting"].as_str().map(str::to_owned),
                 needs: items(&task["needs"])
                     .filter_map(|need| names.iter().position(|n| Some(n.as_str()) == need.as_str()))
@@ -283,7 +282,6 @@ impl Backend for Remote {
                 slots: number(&worker["slots"]),
                 used: number(&worker["used"]),
                 labels: list(&worker["labels"]),
-                executors: list(&worker["executors"]),
                 available_memory: worker["available_memory"].as_u64().unwrap_or(0),
                 free_disk: worker["free_disk"].as_u64().unwrap_or(0),
                 heartbeat_age_ms: worker["heartbeat_age_ms"].as_i64().unwrap_or(0),

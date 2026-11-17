@@ -288,7 +288,7 @@ fn workers_are_listed_and_drained() {
         "READY",
         "1/8",
         "12.0G",
-        "big,docker",
+        "big",
         "w1 is running 1 task of the 8",
     ]);
     tui.keys("d");

@@ -143,13 +143,10 @@ The worker file has no sections.
 | `token_file` | none | A file with the join token (`lwwo token worker`). Needed only the first time: after joining, the worker has its certificate in `data_dir`. |
 | `token` | none | The join token itself. In the file or as `LWWO_WORKER_TOKEN`; **not accepted as a flag**, where `ps` would show it. |
 | `name` | the host name | The name of the worker, unique in the cluster: letters, digits, `_`, `-` and `.`, at most 64 characters. After joining, the name in the certificate counts. |
-| `data_dir` | `/var/lib/lwwo-worker` | Certificates, the journal of the attempts in progress, working directories, git cache. Created with mode `0700`. One worker per directory. |
+| `data_dir` | `/var/lib/lwwo-worker` | Certificates, the journal of the attempts in progress, working directories. Created with mode `0700`. One worker per directory. |
 | `slots` | number of CPUs | How many slots the worker offers. A task takes `slots` of them (1 unless the DAG says more). |
 | `labels` | `[]` | Labels of this worker. A task with `labels` runs only on a worker that has them all. |
-| `executors` | `["process"]` | What the worker can run: `process` (commands on the host), `docker` or `podman` (tasks with an `image`). |
 | `workdir` | `<data_dir>/work` | Where each attempt gets its own working directory, removed when the attempt ends. |
-| `cache_dir` | `<data_dir>/cache` | Mirrors of the git repositories named in `source`. |
-| `cache_max` | `20GB` | Above this the mirrors used least recently are removed. |
 | `min_free_disk` | `10%` | With less free disk the worker takes no new tasks (running ones go on). |
 | `min_free_memory` | `10%` | The same for memory. |
 | `kill_grace` | `30s` | To stop a task the worker sends SIGTERM to its whole process group, and SIGKILL after this long. |
@@ -163,7 +160,6 @@ master = "master.internal:7071"
 token_file = "/etc/lwwo/join.token"
 slots = 8
 labels = ["big"]
-executors = ["process", "docker"]
 ```
 
 ## Standalone
@@ -254,13 +250,9 @@ valid instant after it; a time that happens twice runs only the first time.
 
 | Field | Default | Meaning |
 | --- | --- | --- |
-| `run` | required | The command, as a list: program and arguments. No shell is involved; for one, write `[sh, -c, "…"]`. Exit code 0 is success. |
+| `run` | required | The command, as a list: program and arguments, run as a process on the worker's host. No shell is involved; for one, write `[sh, -c, "…"]`. Exit code 0 is success. Containers and code checkouts are part of the command when a task needs them (`[docker, run, …]`). |
 | `needs` | `[]` | Tasks that must succeed first. If one fails, this task is skipped. |
-| `image` | none | Run the command in this container image. Needs a worker with `docker` or `podman`. Without it the command runs on the worker's host. |
-| `source` | none | `{git: <url>, ref: <branch, tag or commit>}`: the repository is checked out into the task's working directory before it starts. |
 | `env` | `{}` | Environment variables for the task. Values may use templates. Names starting with `LWWO_` are reserved. The DAG's `defaults.env` and the task's are merged. |
-| `pass_env` | `[]` | Containers only: variables of the worker's environment to let in. (A host process inherits the worker's environment already.) |
-| `volumes` | `[]` | Containers only: mounts, as `host_path:container_path`, with an optional `:ro`. |
 | `labels` | `[]` | The task runs only on a worker that has all these labels. |
 | `slots` | `1` | How many of the worker's slots the task takes. |
 | `retries` | master's `[defaults]` | See `[defaults]`. |
@@ -284,19 +276,17 @@ as environment variables.
 | `{{ task.name }}` | `LWWO_TASK` | name of the task |
 | `{{ task.attempt }}` | `LWWO_ATTEMPT` | 1 for the first attempt |
 | `{{ params.x }}` | `LWWO_PARAM_X` | parameter `x` (the variable name is upper case, `-` becomes `_`) |
-| | `LWWO_WORKDIR` | the private working directory of the attempt (`/work` in a container), removed when the attempt ends |
+| | `LWWO_WORKDIR` | the private working directory of the attempt, removed when the attempt ends |
 
 lwwo does not pass data between tasks: a task returns only its exit code.
 Tasks exchange data through a location they derive from these values, such
 as `/data/$LWWO_RUN_ID/raw.json`, reachable from every worker that can run
 them.
 
-What a task sees of the environment:
-
-- **Host process:** the worker's environment, minus every `LWWO_*` variable
-  of the worker itself (its configuration and token), plus `env` and the
-  variables above.
-- **Container:** only `env`, `pass_env` and the variables above.
+What a task sees of the environment: the worker's environment, minus every
+`LWWO_*` variable of the worker itself (its configuration and token), plus
+`env` and the variables above. A task that starts a container passes what
+the container needs on its own command line.
 
 ## Where a value comes from
 
@@ -308,8 +298,8 @@ task field  →  DAG `defaults`  →  master `[defaults]`  →  built-in default
 
 This holds for `retries`, `retry_delay`, `retry_backoff`, `max_retry_delay`
 and `timeout`. `catchup` and `overlap` go from the DAG straight to the
-master's `[defaults]`. The other task fields (`image`, `source`, `env`,
-`labels`, `slots`, `pass_env`, `volumes`) stop at the DAG's `defaults`.
+master's `[defaults]`. The other task fields (`env`, `labels`, `slots`) stop
+at the DAG's `defaults`.
 
 A run keeps the DAG version it started with: applying a new version changes
 the next runs, not the ones in progress.

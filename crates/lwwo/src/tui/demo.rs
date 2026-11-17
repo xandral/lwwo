@@ -38,7 +38,6 @@ fn tasks(sketch: &[Sketch], now: i64) -> Vec<TaskRow> {
             name: name.to_owned(),
             state,
             command: format!("python {name}.py --day {{{{ run.date }}}}"),
-            image: (name == "train").then(|| "ghcr.io/acme/ml:2.1".to_owned()),
             waiting: None,
             needs: needs.iter().filter_map(|need| position(need)).collect(),
             attempts: attempts
@@ -237,7 +236,6 @@ impl Demo {
                     slots: 8,
                     used: 1,
                     labels: vec!["big".to_owned()],
-                    executors: vec!["process".to_owned(), "docker".to_owned()],
                     available_memory: 12 << 30,
                     free_disk: 180 << 30,
                     heartbeat_age_ms: 2_000,
@@ -248,7 +246,6 @@ impl Demo {
                     slots: 4,
                     used: 0,
                     labels: Vec::new(),
-                    executors: vec!["process".to_owned()],
                     available_memory: 3 << 30,
                     free_disk: 40 << 30,
                     heartbeat_age_ms: 4_000,

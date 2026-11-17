@@ -50,11 +50,11 @@ The system has six parts. Master, worker and TUI are the same Rust binary starte
 
 | Component | Role | Technology |
 | --- | --- | --- |
-| DAG | describes a workflow: tasks, dependencies, schedule, image, command | a YAML file, loaded with `lwwo apply` |
+| DAG | describes a workflow: tasks, dependencies, schedule, command | a YAML file, loaded with `lwwo apply` |
 | Database | stores DAGs and their versions, runs, task state and the next scheduled time of every DAG | SQLite in WAL mode; only the master writes |
 | Master | accepts applies and commands, starts scheduled runs, decides which tasks start and on which worker | tokio event loop, HTTP/JSON API, gRPC endpoint |
 | Worker | connects to the master, runs tasks, reports outcomes | the same binary in worker mode |
-| Task | the actual work | a process on the host or a container (Docker, Podman); code from the image or from git |
+| Task | the actual work | a command, run as a process on the worker's host; containers and code checkouts, when needed, are part of the command |
 | TUI | shows DAGs, runs, tasks, workers and logs, and accepts actions from the keyboard, in the style of k9s | `lwwo tui`, built with ratatui; uses the HTTP API and receives updates by streaming |
 
 ## Code structure
@@ -88,7 +88,7 @@ A run goes through seven steps. Steps four to six repeat until every task has fi
 2. **Schedule.** At the scheduled time the kernel wakes the master, which asks the database which DAGs are due, with their YAML. For each one it builds the graph, unless it is already in memory, and in a single transaction creates the run with its tasks and advances the timetable. It then asks the database for the next scheduled time and re-arms the alarm.
 3. **Ready tasks.** Tasks without dependencies enter the ready queue.
 4. **Push.** For each free slot the master picks a worker with the required labels and saves the assignment. Only after the commit does it send `Assign`.
-5. **Execution.** The worker prepares the working directory, the image and the code, launches the task and supervises it, while it keeps sending heartbeats.
+5. **Execution.** The worker creates the working directory, launches the task and supervises it, while it keeps sending heartbeats.
 6. **Outcome.** The worker sends `Report`. The master saves it, answers with `Confirm` and unblocks the successors: those with no dependency left go back to step 4.
 7. **End.** When every task has finished, the run leaves memory and remains only in the database. The DAG's graph leaves memory with its last open run.
 
@@ -214,7 +214,7 @@ The graph is not the bottleneck: the costs that matter are the write to SQLite a
 
 The worker executes tasks, and it must also supervise them, never lose an outcome, and survive both a restart of the master and its own.
 
-- **Registration.** The worker introduces itself with `Hello`: slots, labels, available executors and, when it is reconnecting or has just restarted, the tasks already in progress.
+- **Registration.** The worker introduces itself with `Hello`: slots, labels and, when it is reconnecting or has just restarted, the tasks already in progress.
 - **Liveness.** It sends a heartbeat at the interval the master sets (5 seconds by default). Free memory, CPU and disk are reported for information only; the one signal the master acts on is `accepting`.
 - **Delegated execution.** The worker does not run tasks itself. For each attempt it writes down what must be done and launches a *shim*, a small process that stays with the task. From then on the worker only reads files.
 - **Whole process tree.** On timeout or cancel the entire process tree of the task is stopped, through a cgroup per task where available.
@@ -267,7 +267,7 @@ The table shows what happens when each part stops:
 - **One worker per data directory,** as for the master: a lock on `<data_dir>/lock`. Two workers on the same directory would pick up the same attempts.
 - **A pid is valid only within one boot of the machine.** The shim stores it together with the boot identifier; after a reboot pids start over, and the worker never signals a pid recorded in a previous boot.
 - **Only the worker that owns an attempt writes its end:** an outcome sent by another worker does not alter history.
-- **The shim enforces the timeout,** which includes preparation (the git checkout). The timeout therefore holds while the worker is down, as it does while the master is down.
+- **The shim enforces the timeout,** counted from the moment the shim starts. The timeout therefore holds while the worker is down, as it does while the master is down.
 - **Shim liveness is a lock, not a pid:** the kernel releases the lock when the shim dies, and a lock cannot be mistaken for another process.
 - **Stopping a worker does not stop its tasks.** An upgrade of the worker interrupts nothing. To take a worker out of service, it is drained first with `lwwo drain`.
 - **Under systemd, `KillMode=process` is required;** otherwise stopping the service kills its whole control group, shims included.
@@ -278,7 +278,7 @@ A single bidirectional gRPC session, opened by the worker, carries eight message
 
 | Message | Direction | Purpose |
 | --- | --- | --- |
-| `Hello` | worker → master | identifies the worker: slots, labels, executors, tasks in progress |
+| `Hello` | worker → master | identifies the worker: slots, labels, tasks in progress, protocol version |
 | `Heartbeat` | worker → master | signals that the worker is alive: tasks in progress, free resources (informative), and whether it accepts more tasks |
 | `Ack` | worker → master | a task was accepted or refused; a refusal counts as a failed attempt |
 | `Report` | worker → master | a task started, or finished: outcome, exit code, times, peak memory |
@@ -315,9 +315,10 @@ message Hello {
   string worker_id = 1;
   uint32 slots = 2;
   repeated string labels = 3;     // "gpu", "big"
-  repeated string executors = 4;  // "process", "docker", "podman"
+  reserved 4;                     // executors, removed in protocol 2
   uint64 total_memory = 5;
   repeated TaskRef in_flight = 6; // running, or finished and not confirmed
+  uint32 protocol = 7;            // the version of this contract the worker speaks
 }
 
 message Heartbeat {
@@ -347,7 +348,7 @@ Workers and clients authenticate the master, and the master authenticates each w
 | Holder of an API token | everything: apply DAGs, start runs, create tokens, remove workers. A DAG is a command, so an API token amounts to command execution on every worker, as the worker's user | there are no roles: an API token is an administrator credential |
 | Holder of the join token | register one new worker under an unused name | it cannot call the API or claim the name of a registered worker |
 | A worker | receive tasks, report their outcomes, write the logs of its own attempts | its certificate carries its name; outcomes and log chunks for attempts assigned to another worker are discarded |
-| A task | whatever the worker's user can do on that machine, including reading the worker's key, its journal and the files of other tasks | nothing: tasks of different DAGs are not isolated from each other. A container sees only its working directory, `env`, `pass_env` and `volumes` |
+| A task | whatever the worker's user can do on that machine, including reading the worker's key, its journal and the files of other tasks | nothing: tasks of different DAGs are not isolated from each other |
 | Another user of the master's or worker's machine | nothing | data directories are created with mode `0700`, keys and tokens with `0600` |
 | A web page open in a browser on the machine of a standalone | nothing | without tokens the API refuses requests that carry an `Origin` header or a `Host` other than `127.0.0.1`, `localhost` or `[::1]` |
 
@@ -533,7 +534,8 @@ The orchestrator launches tasks and collects their outcomes; data and secrets re
 - **Working directory.** Each attempt runs in a private directory (`LWWO_WORKDIR`, `/work` in a container), created before the task starts and removed when the attempt ends. A `source` checkout is placed there. It holds temporary files, not data shared between tasks.
 - **Outcome.** Exit code 0 is success; any other code, or a timeout, is failure.
 - **No secret management.** Tasks obtain secrets from the service already in place, such as Vault or a cloud secret manager, using the identity of the worker's machine. Secret values never belong in the YAML.
-- **Environment.** Host processes inherit the worker's environment, except the worker's own `LWWO_` variables, such as its token, which are removed. Containers receive only the variables listed in `pass_env` and the mounts in `volumes`.
+- **Environment.** A task inherits the worker's environment, except the worker's own `LWWO_` variables, such as its token, which are removed, plus its `env` and the `LWWO_*` variables of the run.
+- **What a task runs is up to the task.** lwwo starts one command as a process on the worker's host. A task that needs a container, a checkout of its code or any other preparation does it in that command, for example `docker run …` or a script that runs `git clone`. lwwo neither pulls images nor fetches code.
 - **Map and loop** are planned and will require a small task output, to be added as an optional field of the outcome.
 
 ## Logs
@@ -560,7 +562,7 @@ The shim, not the task, writes every line, and every line has the same three fie
 | --- | --- |
 | `O` | the task's standard output |
 | `E` | the task's standard error |
-| `S` | lwwo itself: the git checkout (`cloning …`, `git: …`), why the task was stopped (`timeout: stopping the task`, `cancelled: stopping the task`, `the worker has been away too long: stopping the task`), an error that prevented the start, and the notice that the spool limit was reached |
+| `S` | lwwo itself: why the task was stopped (`timeout: stopping the task`, `cancelled: stopping the task`, `the worker has been away too long: stopping the task`), an error that prevented the start, and the notice that the spool limit was reached |
 
 - **The time is when the shim read the line,** in UTC milliseconds by the worker's clock. It is not a time the task printed, and it is not corrected for clock differences between machines.
 - **A line ends at `\n`.** The trailing `\n` or `\r\n` is removed, and the shim adds its own `\n`. Output that ends without a newline becomes a last line when the stream closes.

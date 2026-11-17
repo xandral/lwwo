@@ -44,8 +44,8 @@ message TaskRef {
 message Hello {
   string worker_id = 1;
   uint32 slots = 2;
-  repeated string labels = 3;    // "gpu", "big", "docker"
-  repeated string executors = 4; // "process", "docker", "podman"
+  repeated string labels = 3;    // "gpu", "big"
+  reserved 4;                    // executors, removed in protocol 2
   uint64 total_memory = 5;
   repeated TaskRef in_flight = 6; // running, or finished and not yet confirmed
   uint32 protocol = 7;            // the version of this contract the worker speaks
@@ -94,20 +94,12 @@ message Report {
   }
 }
 
-message GitSource {
-  string git = 1;
-  string ref = 2;
-}
-
 message Assign {
   TaskRef task = 1;
   string dag = 2;
   repeated string command = 3;    // templates already rendered
   map<string, string> env = 4;    // the task's `env` plus the LWWO_* variables
-  optional string image = 5;      // none: a process on the host
-  optional GitSource source = 6;
-  repeated string pass_env = 7;
-  repeated string volumes = 8;
+  reserved 5 to 8;                // image, source, pass_env, volumes, removed in protocol 2
   optional uint64 timeout_ms = 9; // measured by the worker
   uint32 slots = 10;
 }

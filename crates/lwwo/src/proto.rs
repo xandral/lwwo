@@ -8,4 +8,4 @@ tonic::include_proto!("lwwo.v1");
 /// a change means one side would misread the other: a master and a worker
 /// that speak different versions refuse to work together, and say so,
 /// instead of failing in a strange way later.
-pub(crate) const PROTOCOL: u32 = 1;
+pub(crate) const PROTOCOL: u32 = 2;

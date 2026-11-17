@@ -542,15 +542,11 @@ impl<B: Backend> App<B> {
                 if let Some(why) = &task.waiting {
                     return format!("{} is ready, but waits for a worker: {why}.", task.name);
                 }
-                let place = match &task.image {
-                    Some(image) => format!(" in {image}"),
-                    None => String::new(),
-                };
                 if needs.is_empty() {
-                    format!("{} starts the run{place}. $ {}", task.name, task.command)
+                    format!("{} starts the run. $ {}", task.name, task.command)
                 } else {
                     format!(
-                        "{} needs {}{place}. $ {}",
+                        "{} needs {}. $ {}",
                         task.name,
                         needs.join(", "),
                         task.command

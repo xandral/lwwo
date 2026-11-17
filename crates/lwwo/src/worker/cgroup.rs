@@ -89,11 +89,6 @@ mod imp {
     pub(crate) struct Cgroup(Option<PathBuf>);
 
     impl Cgroup {
-        /// No cgroup: every method does nothing.
-        pub(crate) fn none() -> Self {
-            Self(None)
-        }
-
         /// The cgroup of a task under `base`, the directory the worker
         /// prepared; created if it is not there yet.
         pub(crate) fn at(base: Option<&Path>, id: &str) -> Self {
@@ -152,10 +147,6 @@ mod imp {
     pub(crate) struct Cgroup;
 
     impl Cgroup {
-        pub(crate) fn none() -> Self {
-            Self
-        }
-
         pub(crate) fn at(_base: Option<&std::path::Path>, _id: &str) -> Self {
             Self
         }

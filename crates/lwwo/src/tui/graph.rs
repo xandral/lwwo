@@ -624,7 +624,6 @@ mod tests {
                 name: (*name).to_owned(),
                 state: TaskState::Blocked,
                 command: String::new(),
-                image: None,
                 waiting: None,
                 needs: needs.iter().map(|need| index(need)).collect(),
                 attempts: Vec::new(),

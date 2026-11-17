@@ -525,8 +525,7 @@ fn draw_workers<B: Backend>(app: &App<B>, frame: &mut Frame, area: Rect) {
             .checked_div(worker.slots as usize)
             .unwrap_or(0)
             .min(cells);
-        let mut tags = worker.labels.clone();
-        tags.extend(worker.executors.iter().filter(|e| *e != "process").cloned());
+        let tags = worker.labels.clone();
         Line::from(vec![
             cursor_mark(selected),
             name_cell(&worker.name, name_width, selected),

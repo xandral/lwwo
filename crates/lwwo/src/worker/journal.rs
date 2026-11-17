@@ -38,18 +38,10 @@ pub(crate) struct Spec {
     pub(crate) dag: String,
     pub(crate) command: Vec<String>,
     pub(crate) env: BTreeMap<String, String>,
-    pub(crate) image: Option<String>,
-    /// Repository and reference to check out first.
-    pub(crate) source: Option<(String, String)>,
-    pub(crate) pass_env: Vec<String>,
-    pub(crate) volumes: Vec<String>,
-    /// How long the whole attempt may take, preparation included.
+    /// How long the attempt may take.
     pub(crate) timeout_ms: Option<u64>,
-    pub(crate) executors: Vec<String>,
     /// The private working directory of the attempt.
     pub(crate) workdir: PathBuf,
-    pub(crate) cache_dir: PathBuf,
-    pub(crate) cache_max: u64,
     pub(crate) kill_grace_ms: u64,
     /// Where task cgroups go, if the worker can create them.
     pub(crate) cgroup_base: Option<PathBuf>,
@@ -72,7 +64,7 @@ impl Spec {
         (self.run.clone(), self.task.clone(), self.attempt)
     }
 
-    /// A name for the container and the cgroup of the attempt.
+    /// A name for the cgroup of the attempt.
     pub(crate) fn name(&self) -> String {
         let run = self.run.replace('-', "");
         let tail = &run[run.len().saturating_sub(12)..];

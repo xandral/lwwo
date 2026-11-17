@@ -282,11 +282,10 @@ pub(crate) async fn workers(client: &Client) -> Result<()> {
                 format!("{}/{}", text(&worker["used"]), text(&worker["slots"])),
                 state.to_owned(),
                 list("labels"),
-                list("executors"),
             ]
         })
         .collect();
-    table(&["WORKER", "SLOTS", "STATE", "LABELS", "EXECUTORS"], &rows);
+    table(&["WORKER", "SLOTS", "STATE", "LABELS"], &rows);
     Ok(())
 }
 

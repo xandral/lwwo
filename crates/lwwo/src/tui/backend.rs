@@ -186,8 +186,6 @@ pub(crate) struct TaskRow {
     pub(crate) state: TaskState,
     /// The command, as written in the DAG.
     pub(crate) command: String,
-    /// The image it runs in, if it is a container.
-    pub(crate) image: Option<String>,
     /// The tasks this one waits for, as positions in the run's tasks.
     pub(crate) needs: Vec<usize>,
     /// Ready to run, but no worker takes it: why, in words.
@@ -218,7 +216,6 @@ pub(crate) struct WorkerRow {
     pub(crate) slots: u32,
     pub(crate) used: u32,
     pub(crate) labels: Vec<String>,
-    pub(crate) executors: Vec<String>,
     pub(crate) available_memory: u64,
     pub(crate) free_disk: u64,
     /// How long ago it last said it was alive, in milliseconds.

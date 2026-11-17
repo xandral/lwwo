@@ -333,7 +333,6 @@ impl Worker {
             worker_id: self.name.clone(),
             slots: self.shared.config.slots(),
             labels: self.shared.config.labels.clone(),
-            executors: self.shared.config.executors.clone(),
             total_memory: memory().0,
             in_flight: self.in_flight(),
             protocol: proto::PROTOCOL,
@@ -493,11 +492,7 @@ pub(crate) async fn run(config: WorkerConfig, address: String, secure: bool) -> 
     // Before anything else: the shims of a previous worker are watching
     // this file to know whether to go on.
     shared.touch_alive();
-    info!(
-        "worker {name}: {} slots, executors {:?}",
-        shared.config.slots(),
-        shared.config.executors
-    );
+    info!("worker {name}: {} slots", shared.config.slots());
     let mut worker = Worker {
         name,
         shared,

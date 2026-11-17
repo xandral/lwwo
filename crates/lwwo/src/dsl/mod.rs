@@ -24,24 +24,6 @@ use crate::zone::Zone;
 
 pub(crate) use template::RunContext;
 
-/// A label the master gives to workers that run processes, and asks of
-/// tasks without an image: executors are placed like labels.
-pub(crate) const PROCESS_LABEL: &str = "lwwo:process";
-
-/// The same for workers with docker or podman, and tasks with an image.
-pub(crate) const CONTAINER_LABEL: &str = "lwwo:container";
-
-/// Where the code of a task comes from.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct Source {
-    /// The repository to clone into the working directory.
-    pub(crate) git: String,
-    /// Branch, tag or commit.
-    #[serde(rename = "ref")]
-    pub(crate) reference: String,
-}
-
 /// A task as written: every field optional, so that the same shape reads
 /// both `defaults` and the tasks.
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -49,11 +31,7 @@ pub(crate) struct Source {
 struct RawTask {
     run: Option<Vec<String>>,
     needs: Option<Vec<String>>,
-    image: Option<String>,
-    source: Option<Source>,
     env: Option<BTreeMap<String, String>>,
-    pass_env: Option<Vec<String>>,
-    volumes: Option<Vec<String>>,
     labels: Option<Vec<String>>,
     slots: Option<u32>,
     retries: Option<u32>,
@@ -86,11 +64,7 @@ pub(crate) struct Task {
     pub(crate) name: String,
     pub(crate) run: Vec<String>,
     pub(crate) needs: Vec<String>,
-    pub(crate) image: Option<String>,
-    pub(crate) source: Option<Source>,
     pub(crate) env: BTreeMap<String, String>,
-    pub(crate) pass_env: Vec<String>,
-    pub(crate) volumes: Vec<String>,
     pub(crate) labels: Vec<String>,
     pub(crate) slots: u32,
     pub(crate) retries: Option<u32>,
@@ -152,17 +126,7 @@ impl Task {
             name: name.to_owned(),
             run,
             needs: task.needs.unwrap_or_default(),
-            image: task.image.or_else(|| defaults.image.clone()),
-            source: task.source.or_else(|| defaults.source.clone()),
             env,
-            pass_env: task
-                .pass_env
-                .or_else(|| defaults.pass_env.clone())
-                .unwrap_or_default(),
-            volumes: task
-                .volumes
-                .or_else(|| defaults.volumes.clone())
-                .unwrap_or_default(),
             labels: task
                 .labels
                 .or_else(|| defaults.labels.clone())
@@ -194,18 +158,9 @@ impl Task {
             BackoffKind::Exponential => Backoff::Exponential,
             BackoffKind::Fixed => Backoff::Fixed,
         };
-        let mut labels = self.labels.clone();
-        labels.push(
-            if self.image.is_some() {
-                CONTAINER_LABEL
-            } else {
-                PROCESS_LABEL
-            }
-            .to_owned(),
-        );
         TaskOptions {
             slots: self.slots,
-            labels,
+            labels: self.labels.clone(),
             retries: self.retries.unwrap_or(defaults.retries),
             retry_delay: self
                 .retry_delay_ms
@@ -479,13 +434,8 @@ tasks:
 
     #[test]
     fn the_examples_are_valid() {
-        for yaml in [
-            include_str!("../../../../examples/dags/etl_sales.yaml"),
-            include_str!("../../../../examples/dags/container.yaml"),
-        ] {
-            let dag = Dag::parse(yaml).unwrap();
-            dag.graph(&Defaults::default()).unwrap();
-        }
+        let dag = Dag::parse(include_str!("../../../../examples/dags/etl_sales.yaml")).unwrap();
+        dag.graph(&Defaults::default()).unwrap();
     }
 
     #[test]
