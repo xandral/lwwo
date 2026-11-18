@@ -126,7 +126,6 @@ async fn stop(spec: &Spec, child: &mut Child, cgroup: &Cgroup) {
     let _ = child.wait().await;
 }
 
-/// Kills the container of the attempt, if the task runs in one.
 /// Decides when the task must be stopped, and says so on `stop`.
 async fn watch_for_stop(
     spec: Spec,

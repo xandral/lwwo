@@ -30,9 +30,9 @@ Measurements on the release binary, on a laptop:
 | --- | --- |
 | Size of the binary | 17 MB |
 | Master and worker at rest | 10 MB of memory, 0% CPU |
-| 1,000 independent empty tasks on 16 slots | 16 s, about 60 tasks per second |
-| A chain of 300 empty tasks | 76 s, about 250 ms per task: the interval at which the worker polls the shim's files (see "Known limitations") |
-| Memory after those 1,300 tasks | 21 MB |
+| 1,000 independent empty tasks on 16 slots | 8.9 s, about 110 tasks per second |
+| A chain of 300 empty tasks | 3.7 s, about 12 ms per task |
+| Memory after those 1,300 tasks | 18 MB |
 
 ## Known limitations
 
@@ -50,7 +50,6 @@ Points where the implementation does less than [design.md](design.md) states.
 - [ ] **Scheduling test:** it failed once and the failure was not reproduced. The likely cause is the port collision between parallel tests that was fixed later; this is not proven.
 - [ ] **Live TUI:** the live log and the graph are verified only on demo data, not yet against a real master.
 - [ ] **Interrupted renewal:** if the worker stops between the master's response to `Renew` and saving the new certificate, its old certificate is no longer valid and it must join again after `lwwo worker remove`. The master could accept the previous certificate until the new one is first used.
-- [ ] **Fixed latency per task:** the worker polls the shim's files every 250 ms, which adds about that much to every task. A chain of 300 empty tasks takes 76 s, and 1,000 parallel ones on 16 slots take 16 s. The overhead is negligible for tasks that last minutes.
 - [ ] **A worker cut off from the network keeps its tasks** (see "Surviving a worker restart"). Stopping them after `heartbeat_timeout` without contact with the master would also stop every task whenever the master is down for longer than that.
 
 - [ ] **Live log over half the limit:** while an attempt runs, `follow` shows its output only up to half of `max_per_attempt`; the kept end appears when the log is closed. Reading the `.tail` files while the attempt runs would remove the gap.

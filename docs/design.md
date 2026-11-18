@@ -240,6 +240,7 @@ attempts/<run>/<task>/<attempt>/
 ```
 
 - Files are written under a temporary name and then renamed, so a file is either absent or complete.
+- **How the worker reads them.** One kernel watcher (inotify on Linux, FSEvents on macOS) covers the directories of all attempts in progress. The worker reads an attempt's files when one of them changes, and in any case every 2 seconds, because a shim that dies changes no file. The worker registers the directory before its first read, so a change between two reads is never missed. If the watcher cannot be started, or a directory cannot be watched, the worker reads that attempt's files every 250 ms instead.
 - The directory is removed when the master sends `Confirm`, not when the task ends: in between, the outcome exists nowhere else. In steady state the disk holds only the tasks in progress and those awaiting confirmation.
 
 **The shim.** A process can learn the exit code only of its own children. If the worker ran tasks directly, stopping the worker would orphan them and lose their outcomes. Each task therefore has a guardian, `lwwo shim`, the same binary in another mode:
@@ -259,7 +260,7 @@ The table shows what happens when each part stops:
 | --- | --- |
 | the worker, which then restarts | tasks continue under their shims; the new worker finds the directories, declares the tasks in its `Hello` and resumes shipping logs and outcomes. No task is restarted |
 | the worker, which does not return | after `heartbeat_timeout` the master reassigns the tasks; at the same moment each shim, no longer seeing signs of life from the worker, stops its task. The two copies never overlap |
-| the shim | the worker finds `shim.lock` unlocked and `exit.json` missing: it stops what is left of the task and reports it as `lost`. The master starts it again without using up a retry |
+| the shim | at two reads in a row, about 4 seconds apart at most, the worker finds `shim.lock` unlocked and `exit.json` missing: it stops what is left of the task and reports it as `lost`. The master starts it again without using up a retry |
 | the machine | everything stops; at restart the worker finds the directories and reports `lost` |
 | the worker's network | after `heartbeat_timeout` the master reassigns the tasks, but the worker is alive and cannot tell a master that is down from one that is unreachable, so its copy continues. When the network returns the master tells it to stop. Until then the task runs twice, which is why tasks must be idempotent |
 

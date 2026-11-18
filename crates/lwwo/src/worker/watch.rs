@@ -21,12 +21,11 @@ use tracing::warn;
 use super::cgroup::Cgroup;
 use super::journal::{self, Exit, Spec, Started};
 use super::ship::{Key, Shipper};
+use super::wake::Wakeups;
 use crate::config::WorkerConfig;
 use crate::proto;
 use crate::util::now_ms;
 
-/// How often the journal of a running attempt is looked at.
-const LOOK_EVERY: Duration = Duration::from_millis(250);
 /// A shim gets this long to take its lock before it is given up.
 const SHIM_START: Duration = Duration::from_secs(5);
 
@@ -47,6 +46,8 @@ pub(crate) struct Shared {
     /// The heartbeat timeout of the master, in milliseconds: a task whose
     /// worker is away longer than this stops by itself.
     pub(crate) orphan_timeout_ms: AtomicU64,
+    /// Wakes the followers when the files of their attempt change.
+    pub(crate) wakeups: Wakeups,
 }
 
 impl Shared {
@@ -207,6 +208,8 @@ pub(crate) async fn follow(
     shared
         .shipper
         .track(key.clone(), spec.dag.clone(), dir.join("log"));
+    // Watched before the first look, so no change is missed in between.
+    let watch = shared.wakeups.watch(&dir);
     let mut told_started = false;
     let mut shim_missing = 0;
     let exit = loop {
@@ -238,8 +241,9 @@ pub(crate) async fn follow(
             }
         }
         shared.shipper.grew();
-        tokio::time::sleep(LOOK_EVERY).await;
+        watch.changed().await;
     };
+    drop(watch);
     // The report comes after the log, so the master can save both
     // together.
     shared.shipper.grew();

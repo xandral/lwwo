@@ -12,6 +12,7 @@ mod cgroup;
 mod journal;
 pub(crate) mod shim;
 mod ship;
+mod wake;
 mod watch;
 
 use std::collections::HashMap;
@@ -27,6 +28,7 @@ use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity
 use tracing::{info, warn};
 
 use self::ship::{Key, Shipper};
+use self::wake::Wakeups;
 use self::watch::{Shared, TaskEvent};
 use crate::config::WorkerConfig;
 use crate::proto::master_client::MasterClient;
@@ -487,6 +489,7 @@ pub(crate) async fn run(config: WorkerConfig, address: String, secure: bool) -> 
         cgroup_base: cgroup::prepare(config.cgroups),
         // Until the master says otherwise, its default.
         orphan_timeout_ms: AtomicU64::new(30_000),
+        wakeups: Wakeups::start(),
         config,
     });
     // Before anything else: the shims of a previous worker are watching
