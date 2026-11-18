@@ -42,10 +42,12 @@ principles.
   tasks arrive on it the moment they are ready. Workers need no open ports,
   and nothing waits for a polling round.
 - **A crash loses nothing, on either side.** The master commits to SQLite
-  before it sends anything, so after a restart it resumes where it was and
-  no task runs twice. A worker hands each task to a small guardian process
-  and keeps a journal on disk, so it can be restarted or upgraded while its
-  tasks keep running.
+  before it sends anything, so after a restart it resumes where it was, and
+  a task that finished is not run again. A worker hands each task to a
+  small guardian process and keeps a journal on disk, so it can be
+  restarted or upgraded while its tasks keep running. Delivery is at least
+  once: after a power loss, or while a worker is cut off from the network,
+  a task can run again, so tasks must be idempotent.
 - **Decisions are separate from I/O.** Every decision (which task is ready,
   which worker gets it, what a failure means, when a schedule fires) is in a
   library, `lwwo-core`, with no input or output and no dependencies. It

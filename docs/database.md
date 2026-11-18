@@ -157,7 +157,7 @@ One row per run, created by the cron, by a catch-up or by `lwwo run`.
 | --- | --- | --- | --- |
 | `id` | text, key | UUIDv7: unique and already in time order | `0192f3a4-…` |
 | `dag_name` | text | the DAG | `sales` |
-| `version_hash` | text | the version the run runs with | `9f2c41…` |
+| `version_hash` | text | the version the run runs with; a rerun with `--current` replaces it with the DAG's current version when the run reopens | `9f2c41…` |
 | `logical_time` | integer | the instant of the run: the cron fire, or `--at` in manual runs. Tasks see it as `run.time` and `run.date` | `1792980000000` (Oct 26, 03:00) |
 | `trigger` | text | `cron`, `catchup` (a run started more than a minute late on its fire, because of an interruption or because it waited for the previous run) or `manual` | `cron` |
 | `params` | JSON text | the final values of the parameters, defaults included | `{"country": "IT", "threshold": 100}` |

@@ -524,6 +524,26 @@ fn overlap_queue_makes_a_second_run_wait() {
 }
 
 #[test]
+fn a_rerun_right_after_a_cancel_runs_once_the_old_attempt_stops() {
+    let lab = Lab::new("cancel-rerun");
+    let _master = lab.standalone(&["--worker-slots=1", "--worker-kill_grace=5s"]);
+    let started = lab.dir.join("started");
+    // The first attempt takes two seconds to stop; the next ones succeed.
+    lab.apply(&format!(
+        "name: stubborn\ntasks:\n  work:\n    run: [sh, -c, 'if [ $LWWO_ATTEMPT -ge 2 ]; then exit 0; fi; trap \"sleep 2; exit 1\" TERM; touch {}; sleep 300 & wait']\n  after:\n    needs: [work]\n    run: ['true']\n",
+        started.display()
+    ));
+    let run = lab.run("stubborn", &[]);
+    lab.wait_for("the first attempt", || started.exists());
+    lab.cli(&["cancel", &run]);
+    assert_eq!(lab.finished(&run), "cancelled");
+    lab.cli(&["rerun", &run, "--all"]);
+    assert_eq!(lab.finished(&run), "success");
+    assert_eq!(lab.detail(&run)["run"]["problem"], Value::Null);
+    assert_eq!(lab.outcomes(&run, "work"), ["cancelled", "success"]);
+}
+
+#[test]
 fn a_rerun_waits_for_the_active_run() {
     let lab = Lab::new("queued-rerun");
     let _master = lab.standalone(&[]);
@@ -564,6 +584,39 @@ fn a_rerun_waits_for_the_active_run() {
     assert!(
         started >= ended,
         "the rerun started after the active run ended"
+    );
+}
+
+#[test]
+fn a_fire_that_waited_for_a_run_keeps_the_alarm_going() {
+    let lab = Lab::new("cron-queue");
+    let _master = lab.standalone(&[]);
+    lab.apply(
+        "name: queued_cron\nschedule: '* * * * *'\noverlap: queue\nparams:\n  hold: '0'\ntasks:\n  tick:\n    run: [sleep, '{{ params.hold }}']\n",
+    );
+    // A manual run that is still going when the minute turns.
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis();
+    let hold = (60_000 - now_ms % 60_000) / 1000 + 3;
+    let manual = lab.run("queued_cron", &["--param", &format!("hold={hold}")]);
+    assert_eq!(lab.finished(&manual), "success");
+
+    // The fire waited for it, then ran.
+    let runs = || lab.api("GET", "/runs?dag=queued_cron", None);
+    lab.wait_for("the fire that waited", || {
+        runs().as_array().is_some_and(|r| {
+            r.iter()
+                .any(|run| run["trigger"] != "manual" && run["state"] == "success")
+        })
+    });
+    let next = lab.api("GET", "/dags/queued_cron", None)["dag"]["next_fire"].as_i64();
+    assert!(next.is_some());
+    assert_eq!(
+        lab.api("GET", "/status", None)["next_fire"].as_i64(),
+        next,
+        "the alarm is armed on the next fire"
     );
 }
 
@@ -712,6 +765,41 @@ fn a_restart_of_the_master_reruns_nothing() {
         "the log survived the restart"
     );
     assert_eq!(lab.task(&run, "next")["state"], "success");
+}
+
+#[test]
+fn a_rerun_on_the_current_version_keeps_it_after_a_restart() {
+    let (cluster, mut master) = Cluster::new("rerun-current");
+    let lab = &cluster.lab;
+    let join = lab.cli(&["token", "worker"]);
+    let _w1 = cluster.worker("w1", Some(join.trim()));
+    lab.wait_for("w1 to join", || cluster.connected("w1"));
+
+    let version = |first: &str, second: &str| {
+        format!(
+            "name: evolving\ntasks:\n  first:\n    run: [sh, -c, '{first}']\n  second:\n    needs: [first]\n    run: [echo, '{second}']\n"
+        )
+    };
+    lab.apply(&version("exit 1", "second v1"));
+    let run = lab.run("evolving", &[]);
+    assert_eq!(lab.finished(&run), "failed");
+
+    let started = lab.dir.join("started");
+    lab.apply(&version(
+        &format!("touch {}; sleep 3", started.display()),
+        "second v2",
+    ));
+    lab.cli(&["rerun", &run, "--current"]);
+    lab.wait_for("the first task of the rerun", || started.exists());
+
+    // The master dies while the rerun runs, and comes back.
+    master.kill();
+    let _master = Cluster::master(lab);
+    assert_eq!(lab.finished(&run), "success");
+    assert!(
+        lab.log(&run, "second", 1).contains("second v2"),
+        "the rest of the rerun ran on the version it was given"
+    );
 }
 
 #[test]

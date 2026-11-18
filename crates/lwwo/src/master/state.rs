@@ -71,6 +71,9 @@ impl From<anyhow::Error> for ApiError {
 
 type ApiResult = Result<Value, ApiError>;
 
+/// A write to do in the same transaction as the commands of an event.
+type Write<'a> = dyn Fn(&Store) -> Result<()> + 'a;
+
 /// Which tasks of a run to run again, as asked through the API.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct RerunRequest {
@@ -440,7 +443,7 @@ impl Master {
         self.sessions
             .retain(|&id, _| engine.workers().get(id).is_some());
         self.inflight
-            .retain(|&(run, task), _| engine.running(run, task).is_some());
+            .retain(|&(run, task), _| engine.on_a_worker(run, task));
         if self.dirty {
             self.dirty = false;
             // Nobody listening is fine.
@@ -675,21 +678,31 @@ impl Master {
     /// Gives an event to the engine and carries out its commands. Returns
     /// whether there were any.
     fn engine_event(&mut self, event: Event) -> Result<bool> {
+        self.engine_event_with(event, None)
+    }
+
+    /// Like `engine_event`, with `first` written in the same transaction
+    /// as the commands of the event.
+    fn engine_event_with(&mut self, event: Event, first: Option<&Write<'_>>) -> Result<bool> {
         let commands = self.engine.handle(event, now());
         let any = !commands.is_empty();
-        self.execute(&commands)?;
+        self.execute(&commands, first)?;
         Ok(any)
     }
 
     /// Carries out the commands of one event: first everything that is
-    /// saved, in one transaction, then the messages to the workers.
+    /// saved, in one transaction that starts with `first`, then the
+    /// messages to the workers.
     #[expect(
         clippy::too_many_lines,
         reason = "one arm per command, and they belong in one transaction"
     )]
-    fn execute(&mut self, commands: &[Command]) -> Result<()> {
+    fn execute(&mut self, commands: &[Command], first: Option<&Write<'_>>) -> Result<()> {
         if commands.is_empty() {
-            return Ok(());
+            return match first {
+                Some(first) => self.store.transaction(first),
+                None => Ok(()),
+            };
         }
         let now_ms = now_ms();
         let mut outbox: Vec<(WorkerId, proto::MasterMessage)> = Vec::new();
@@ -701,6 +714,9 @@ impl Master {
         let mut broken: Vec<Event> = Vec::new();
 
         self.store.transaction(|store| {
+            if let Some(first) = first {
+                first(store)?;
+            }
             for command in commands {
                 match *command {
                     Command::SaveTask {
@@ -734,7 +750,13 @@ impl Master {
                         store.finish_run(&run_id_text(run), outcome_text(outcome), now_ms)?;
                         finished.push((run, outcome));
                     }
-                    Command::ReopenRun { run } => store.reopen_run(&run_id_text(run))?,
+                    Command::ReopenRun { run } => {
+                        let open = self
+                            .open
+                            .get(&run)
+                            .context("the engine reopened a run that is not open")?;
+                        store.reopen_run(&open.id, &open.hash)?;
+                    }
                     Command::Quarantine { run, ref reason } => {
                         let name = self.open.get(&run).map_or("?", |open| open.dag.as_str());
                         error!(
@@ -1023,7 +1045,11 @@ impl Master {
                 self.dirty = true;
             }
         }
-        self.decide(dag, now_ms())
+        // A fire that waited for this run may start now and move the
+        // timetable on: the alarm must follow it.
+        let decided = self.decide(dag, now_ms());
+        self.refresh_next_cron()?;
+        decided
     }
 
     // The timetable
@@ -1418,27 +1444,31 @@ impl Master {
             log_bytes: stats.map(|(bytes, _)| bytes),
             log_truncated: stats.is_some_and(|(_, truncated)| truncated),
         };
-        self.store.finish_attempt(
-            &task.run_id,
-            &task.task,
-            task.attempt,
-            self.worker_name(worker),
-            &end,
-        )?;
+        let worker_name = self.worker_name(worker).to_owned();
+        let save = |store: &Store| {
+            store.finish_attempt(&task.run_id, &task.task, task.attempt, &worker_name, &end)
+        };
         self.dirty = true;
 
         if let Some((run, id)) = run.and_then(|run| Some((run, self.task_id(run, &task.task)?))) {
-            // The engine confirms, after the task state is saved.
-            self.engine_event(Event::Report {
-                worker,
-                run,
-                task: id,
-                attempt: task.attempt,
-                outcome: for_engine,
-            })?;
+            // The outcome of the attempt and what it changes in the run
+            // are saved together: a crash between the two would leave a
+            // finished attempt on a task still assigned, which a restart
+            // would run again. The engine confirms after the commit.
+            self.engine_event_with(
+                Event::Report {
+                    worker,
+                    run,
+                    task: id,
+                    attempt: task.attempt,
+                    outcome: for_engine,
+                },
+                Some(&save),
+            )?;
         } else {
-            // A report the master no longer waits for: saved above, so
-            // the worker can forget it.
+            // A report the master no longer waits for: saved, so the
+            // worker can forget it.
+            save(&self.store)?;
             let confirm = proto::Confirm {
                 task: Some(task.clone()),
             };

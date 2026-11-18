@@ -92,7 +92,7 @@ A run goes through seven steps. Steps four to six repeat until every task has fi
 3. **Ready tasks.** Tasks without dependencies enter the ready queue.
 4. **Push.** For each free slot the master picks a worker with the required labels and saves the assignment. Only after the commit does it send `Assign`.
 5. **Execution.** The worker creates the working directory, launches the task and supervises it, while it keeps sending heartbeats.
-6. **Outcome.** The worker sends `Report`. The master saves it, answers with `Confirm` and unblocks the successors: those with no dependency left go back to step 4.
+6. **Outcome.** The worker sends `Report`. In one transaction the master saves the outcome of the attempt, the new state of the task and of the tasks it unblocks or skips; after the commit it answers with `Confirm`. The successors with no dependency left go back to step 4.
 7. **End.** When every task has finished, the run leaves memory and remains only in the database. The DAG's graph leaves memory with its last open run.
 
 ```text
@@ -511,8 +511,9 @@ Waiting takes two forms:
 
 | What waits | Where the wait is recorded | When it resumes |
 | --- | --- | --- |
-| a scheduled occurrence | in the timetable: the row stays behind and no run is created | when a run of the DAG ends |
+| a scheduled occurrence | in the timetable: the row stays behind and no run is created | when a run of the DAG ends; the alarm is then re-armed on the next scheduled time |
 | a manual run | in `dag_runs`, in state `queued` and without tasks | when a run of the DAG ends, ahead of waiting occurrences |
+| a rerun | in `dag_runs`, in state `queued`, with its tasks and the request in `rerun` | as a manual run |
 
 With `skip` a manual run is refused with an error; with `replace` it cancels the active run.
 
@@ -534,7 +535,8 @@ lwwo rerun <run> --all
 lwwo rerun <run> --current            # with the current version, if the structure is identical
 ```
 
-- A rerun uses the DAG version the run started with. The current version can be used only when its structure is identical, that is, the same tasks and dependencies; otherwise a new run is required.
+- A rerun uses the DAG version the run started with. The current version can be used only when its structure is identical, that is, the same tasks and dependencies; otherwise a new run is required. The version chosen is written to `dag_runs.version_hash` in the transaction that reopens the run, so a master restart continues the rerun with it.
+- Attempts of a cancelled run that are still stopping keep their slots until the worker reports them. Their reports free the slots and change nothing in the run, even if it has been reopened in the meantime; the attempts of the rerun get new numbers.
 - A reopened run is subject to the overlap rule like a new run. With `queue` or `allow`, when there is no room, or other runs of the DAG are already waiting, the run becomes `queued` behind them: the request, the version and the previous state are stored in `dag_runs.rerun`, and the run reopens when its turn comes. With `skip` the rerun is refused; with `replace` the active runs are cancelled. Cancelling a run that waits to be rerun returns it to its previous state. If, when its turn comes, nothing is left to run, the run returns to its previous state and the master logs why.
 - "Rerun failed" also includes cancelled tasks, so a cancelled run can be completed.
 - Only a finished run can be rerun. The retries of rerun tasks start from zero; attempt numbers continue.

@@ -240,6 +240,10 @@ pub struct Engine {
     /// Attempts on workers, by run and task. A `BTreeMap`, so that walking
     /// it always gives the same order and so the same commands.
     running: BTreeMap<(RunId, TaskId), Running>,
+    /// Attempts of runs that were closed while they ran, by run, task and
+    /// attempt: their reports only free the slots, even if the run has
+    /// been reopened since.
+    closing: BTreeMap<(RunId, TaskId, u32), Running>,
 }
 
 impl Engine {
@@ -269,6 +273,18 @@ impl Engine {
         self.running
             .get(&(run, task))
             .map(|attempt| (attempt.worker, attempt.attempt))
+    }
+
+    /// Whether a task has an attempt on a worker: running, or of a run
+    /// closed since and still to be reported.
+    #[must_use]
+    pub fn on_a_worker(&self, run: RunId, task: TaskId) -> bool {
+        self.running.contains_key(&(run, task))
+            || self
+                .closing
+                .range((run, task, 0)..=(run, task, u32::MAX))
+                .next()
+                .is_some()
     }
 
     /// The tasks that are ready, with every dependency done, and wait for
@@ -486,15 +502,21 @@ impl Engine {
                 self.deadlines.remove(Deadline::Retry { run, task });
             }
         }
-        // The attempts stay in `running`: their reports free the slots.
-        for (&(r, task), attempt) in &self.running {
-            if r == run {
-                out.push(Command::Cancel {
-                    worker: attempt.worker,
-                    run,
-                    task,
-                });
-            }
+        // The attempts move to `closing`: their reports free the slots.
+        let stopped: Vec<(TaskId, Running)> = self
+            .running
+            .range((run, TaskId::new(0))..)
+            .take_while(|((r, _), _)| *r == run)
+            .map(|(&(_, task), &attempt)| (task, attempt))
+            .collect();
+        for (task, attempt) in stopped {
+            self.running.remove(&(run, task));
+            self.closing.insert((run, task, attempt.attempt), attempt);
+            out.push(Command::Cancel {
+                worker: attempt.worker,
+                run,
+                task,
+            });
         }
         for task in state.cancel() {
             out.push(save(&state, task));
@@ -523,6 +545,25 @@ impl Engine {
         }
         self.expect_heartbeat(worker, now);
 
+        // Attempts of closed runs still hold slots while the worker stops
+        // them; those it no longer has are done.
+        let closing: Vec<((RunId, TaskId, u32), Running)> = self
+            .closing
+            .iter()
+            .filter(|(_, attempt)| attempt.worker == worker)
+            .map(|(&key, &attempt)| (key, attempt))
+            .collect();
+        for (key, attempt) in closing {
+            if in_flight.contains(&key) {
+                if let Err(error) = self.workers.reserve(worker, attempt.slots) {
+                    out.push(Command::Anomaly {
+                        message: format!("{error}"),
+                    });
+                }
+            } else {
+                self.closing.remove(&key);
+            }
+        }
         let mine: Vec<((RunId, TaskId), Running)> = self
             .running
             .iter()
@@ -669,23 +710,27 @@ impl Engine {
         // Only the attempt in `running` counts: anything else is a duplicate
         // or a late report of an attempt already given up.
         let key = (run, task);
-        let Some(&current) = self.running.get(&key) else {
+        let current = self
+            .running
+            .get(&key)
+            .copied()
+            .filter(|current| current.worker == worker && current.attempt == attempt);
+        let Some(current) = current else {
+            // An attempt of a run closed while it ran: it frees its slots.
+            let closed = self
+                .closing
+                .get(&(run, task, attempt))
+                .is_some_and(|closing| closing.worker == worker);
+            if let Some(closing) = closed
+                .then(|| self.closing.remove(&(run, task, attempt)))
+                .flatten()
+            {
+                self.release(worker, closing.slots, out);
+            }
             return;
         };
-        if current.worker != worker || current.attempt != attempt {
-            return;
-        }
         self.running.remove(&key);
-        if let Err(error) = self.workers.release(worker, current.slots) {
-            // The count was wrong: what the worker really has in use is
-            // not known, so the safe value is nothing in use.
-            if let WorkerError::ReleaseTooMany { used, .. } = error {
-                let _ = self.workers.release(worker, used);
-            }
-            out.push(Command::Anomaly {
-                message: format!("{error}: corrected to no slots in use"),
-            });
-        }
+        self.release(worker, current.slots, out);
 
         // A run cancelled while the task ran: only the slots mattered.
         let Some(state) = self.runs.get_mut(&run) else {
@@ -758,6 +803,21 @@ impl Engine {
             .collect();
         for (run, task) in lost {
             self.lose_attempt(run, task, out);
+        }
+        self.closing.retain(|_, attempt| attempt.worker != worker);
+    }
+
+    /// Gives back the slots of an attempt that ended.
+    fn release(&mut self, worker: WorkerId, slots: u32, out: &mut Vec<Command>) {
+        if let Err(error) = self.workers.release(worker, slots) {
+            // The count was wrong: what the worker really has in use is
+            // not known, so the safe value is nothing in use.
+            if let WorkerError::ReleaseTooMany { used, .. } = error {
+                let _ = self.workers.release(worker, used);
+            }
+            out.push(Command::Anomaly {
+                message: format!("{error}: corrected to no slots in use"),
+            });
         }
     }
 
@@ -1273,6 +1333,40 @@ mod tests {
         assert_eq!(out[0], Command::ReopenRun { run: RUN });
         assert!(out.contains(&saved(RUN, t(1), TaskState::Blocked, 0)));
         assert_eq!(assigns(&out), [(W1, t(0), 2)]);
+    }
+
+    #[test]
+    fn a_rerun_right_after_a_cancel_waits_for_the_cancelled_attempt() {
+        let mut engine = Engine::default();
+        join(&mut engine, W1, 1, &[]);
+        start(&mut engine, chain());
+        engine.handle(Event::CancelRun { run: RUN }, at(1));
+        // Rerun before the worker has stopped attempt 1: its slot is
+        // still taken, so attempt 2 waits.
+        let out = engine.handle(
+            Event::RerunRun {
+                run: RUN,
+                graph: chain(),
+                tasks: vec![snap(TaskState::Cancelled, 1), snap(TaskState::Cancelled, 0)],
+                scope: Rerun::All,
+            },
+            at(2),
+        );
+        assert!(assigns(&out).is_empty());
+
+        assert!(engine.on_a_worker(RUN, t(0)), "attempt 1 is still stopping");
+
+        // The report of the cancelled attempt frees the slot, and only
+        // that: the reopened run goes on with attempt 2.
+        let out = report(&mut engine, W1, t(0), 1, Outcome::Failed, at(3));
+        assert!(
+            !out.iter()
+                .any(|c| matches!(c, Command::Quarantine { .. } | Command::Anomaly { .. })),
+            "{out:?}"
+        );
+        assert_eq!(assigns(&out), [(W1, t(0), 2)]);
+        let out = report(&mut engine, W1, t(0), 2, Outcome::Success, at(4));
+        assert_eq!(assigns(&out), [(W1, t(1), 1)]);
     }
 
     #[test]

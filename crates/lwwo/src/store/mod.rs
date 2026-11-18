@@ -469,12 +469,15 @@ impl Store {
         Ok(())
     }
 
-    /// A finished run is running again.
-    pub(crate) fn reopen_run(&self, run: &str) -> Result<()> {
+    /// A finished run is running again, with the version `version_hash`:
+    /// its own, or the current one of the DAG for a rerun with
+    /// `--current`.
+    pub(crate) fn reopen_run(&self, run: &str, version_hash: &str) -> Result<()> {
         self.conn.execute(
-            "UPDATE dag_runs SET state = 'running', finished_at = NULL, problem = NULL, rerun = NULL
+            "UPDATE dag_runs SET state = 'running', finished_at = NULL, problem = NULL, rerun = NULL,
+                    version_hash = ?2
              WHERE id = ?1",
-            [run],
+            params![run, version_hash],
         )?;
         Ok(())
     }
@@ -870,7 +873,7 @@ mod tests {
         assert_eq!(store.rerun_request("r1").unwrap(), None);
 
         store.queue_rerun("r1", "{}").unwrap();
-        store.reopen_run("r1").unwrap();
+        store.reopen_run("r1", "h1").unwrap();
         assert_eq!(store.run("r1").unwrap().unwrap().state, "running");
         assert_eq!(store.rerun_request("r1").unwrap(), None);
     }
