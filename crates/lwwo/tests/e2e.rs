@@ -210,13 +210,14 @@ impl Lab {
 
     /// Waits for the run to end and returns its final state.
     fn finished(&self, run: &str) -> String {
+        // The state that ended the wait: reading it again could meet a
+        // master too busy to answer.
+        let mut state = String::new();
         self.wait_for("the run to end", || {
-            matches!(
-                self.run_state(run).as_str(),
-                "success" | "failed" | "cancelled"
-            )
+            state = self.run_state(run);
+            matches!(state.as_str(), "success" | "failed" | "cancelled")
         });
-        self.run_state(run)
+        state
     }
 
     fn log(&self, run: &str, task: &str, attempt: u32) -> String {

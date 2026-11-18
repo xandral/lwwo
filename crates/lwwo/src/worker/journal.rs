@@ -21,8 +21,9 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
@@ -179,16 +180,29 @@ pub(crate) fn forget(base: &Path, dir: &Path) {
 /// it when it starts and the kernel releases it when the shim ends,
 /// however it ends; unlike a pid, it cannot be mistaken for another
 /// process.
+///
+/// [`shim_alive`] holds the lock for an instant to test it, and the
+/// creation of the file wakes the worker to do just that, so a lock that
+/// is taken is tried again for up to [`LOCK_PATIENCE`]: only one held
+/// that long belongs to another shim.
 pub(crate) fn lock_shim(dir: &Path) -> Result<std::fs::File> {
     let file = std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
         .write(true)
         .open(dir.join("shim.lock"))?;
-    rustix::fs::flock(&file, rustix::fs::FlockOperation::NonBlockingLockExclusive)
-        .context("another shim holds this attempt")?;
+    let start = std::time::Instant::now();
+    while rustix::fs::flock(&file, rustix::fs::FlockOperation::NonBlockingLockExclusive).is_err() {
+        if start.elapsed() >= LOCK_PATIENCE {
+            bail!("another shim holds this attempt");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
     Ok(file)
 }
+
+/// How long a shim tries to take a lock that is held.
+const LOCK_PATIENCE: Duration = Duration::from_secs(1);
 
 /// Whether the shim of an attempt is alive: whether its lock is held.
 pub(crate) fn shim_alive(dir: &Path) -> bool {
@@ -232,6 +246,22 @@ mod tests {
         // Half a file is the same as no file.
         std::fs::write(&path, b"{\"outcome\": \"succ").unwrap();
         assert!(read::<Exit>(&path).is_none());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_shim_waits_for_a_lock_held_for_an_instant() {
+        let dir = temp();
+        std::fs::write(dir.join("shim.lock"), "").unwrap();
+        let checker = std::fs::File::open(dir.join("shim.lock")).unwrap();
+        rustix::fs::flock(&checker, rustix::fs::FlockOperation::LockExclusive).unwrap();
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            drop(checker);
+        });
+        let _lock = lock_shim(&dir).expect("taken once the check lets go");
+        release.join().unwrap();
+        assert!(lock_shim(&dir).is_err(), "held by a shim: given up");
         std::fs::remove_dir_all(dir).unwrap();
     }
 

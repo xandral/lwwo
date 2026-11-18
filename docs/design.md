@@ -240,6 +240,7 @@ attempts/<run>/<task>/<attempt>/
 ```
 
 - Files are written under a temporary name and then renamed, so a file is either absent or complete.
+- **The shim's lock.** The worker tells whether a shim is alive by taking `shim.lock` for an instant: if it succeeds, nobody held it. A shim that finds the lock taken when it starts tries again for up to 1 second, so the worker's test cannot stop it from starting; a lock held longer belongs to another shim, and the second one gives up.
 - **How the worker reads them.** One kernel watcher (inotify on Linux, FSEvents on macOS) covers the directories of all attempts in progress. The worker reads an attempt's files when one of them changes, and in any case every 2 seconds, because a shim that dies changes no file. The worker registers the directory before its first read, so a change between two reads is never missed. If the watcher cannot be started, or a directory cannot be watched, the worker reads that attempt's files every 250 ms instead.
 - The directory is removed when the master sends `Confirm`, not when the task ends: in between, the outcome exists nowhere else. In steady state the disk holds only the tasks in progress and those awaiting confirmation.
 
