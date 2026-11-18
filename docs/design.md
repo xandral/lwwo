@@ -28,13 +28,13 @@ Each line is a property the rest of the document explains.
 ## Overview
 
 ```text
-  CLI and TUI                       worker w1            worker w2
-  apply · run · tui                ┌──────────┐         ┌──────────┐
-      │                            │ task task│         │ task     │
-      │ HTTP/JSON                  └────┬─────┘         └────┬─────┘
-      ▼                                 │  gRPC, stream opened by the worker
-┌───────────────┐   Assign, Cancel ▶    │                    │
-│    MASTER     │◀──────────────────────┴────────────────────┘
+  CLI and TUI                       worker w1               worker w2
+  apply · run · tui                ┌───────────────┐       ┌───────────────┐
+      │                            │ shim ─▶ task  │       │ shim ─▶ task  │
+      │ HTTP/JSON                  │ shim ─▶ task  │       │               │
+      ▼                            └──────┬────────┘       └──────┬────────┘
+┌───────────────┐   Assign, Cancel ▶      │  gRPC, stream opened by the worker
+│    MASTER     │◀────────────────────────┴───────────────────────┘
 │  event loop   │   ◀ Hello, Heartbeat, Report · logs on a separate stream
 └──────┬────────┘
        │ only writer
@@ -46,23 +46,26 @@ The master is the only process that talks to SQLite and to the workers. The data
 
 ## Components
 
-The system has six parts. Master, worker and TUI are the same Rust binary started in different modes.
+The system has seven parts. Master, worker, shim and client are the same Rust binary, `lwwo`, started in different modes.
 
 | Component | Role | Technology |
 | --- | --- | --- |
 | DAG | describes a workflow: tasks, dependencies, schedule, command | a YAML file, loaded with `lwwo apply` |
 | Database | stores DAGs and their versions, runs, task state and the next scheduled time of every DAG | SQLite in WAL mode; only the master writes |
-| Master | accepts applies and commands, starts scheduled runs, decides which tasks start and on which worker | tokio event loop, HTTP/JSON API, gRPC endpoint |
-| Worker | connects to the master, runs tasks, reports outcomes | the same binary in worker mode |
+| Master | accepts applies and commands, starts scheduled runs, decides which tasks start and on which worker | `lwwo master`: tokio event loop around `lwwo-core`, HTTP/JSON API, gRPC endpoint |
+| Worker | connects to the master, receives tasks, starts a shim for each one, ships logs and reports outcomes | `lwwo worker` |
+| Shim | the guardian of one task: starts it, writes its output to the spool, enforces its timeout and writes its outcome; it outlives a restart of the worker | `lwwo shim <directory>`, started by the worker, one per attempt |
 | Task | the actual work | a command, run as a process on the worker's host; containers and code checkouts, when needed, are part of the command |
-| TUI | shows DAGs, runs, tasks, workers and logs, and accepts actions from the keyboard, in the style of k9s | `lwwo tui`, built with ratatui; uses the HTTP API and receives updates by streaming |
+| Client | commands and a terminal interface: the CLI (`lwwo apply`, `run`, `logs`…) and the TUI, which shows DAGs, runs, tasks, workers and logs and accepts actions from the keyboard, in the style of k9s | uses only the master's HTTP API, with streaming for updates; the TUI is built with ratatui |
+
+`lwwo standalone` runs a master and a worker in one process, with data in `./lwwo-data` and the API on `127.0.0.1:7070` without a token: the same components, for trying lwwo on one machine.
 
 ## Code structure
 
 The code is split into two crates: a core that decides and a program that executes.
 
 - **The core** (`lwwo-core`) is a library with no I/O. It receives an event and the current time and returns commands. It never touches the database, the network, the clock or processes.
-- **The program** (`lwwo`) is the binary: master, worker, TUI and CLI. It executes the core's commands and feeds events back to it.
+- **The program** (`lwwo`) is the binary: master, worker, shim, CLI and TUI. It executes the core's commands and feeds events back to it.
 
 ```text
 program → core:  "it is 03:00"
@@ -111,6 +114,18 @@ master                SQLite            w1                w2
 `clean` and `count` run at the same time on w1 and w2. `count` finishes first, but `load` starts only when `clean` reports too and its counter reaches zero. Every `Assign` and every `Confirm` is sent after the commit it depends on.
 
 ## Inside the master
+
+The master is one process made of these parts:
+
+| Part | What it does | Described in |
+| --- | --- | --- |
+| event loop | owns all the state; handles one event at a time with `lwwo-core` and executes the commands it returns | this section, "The run engine" |
+| store | the SQLite database: every change is written there before it is announced | "Database" |
+| HTTP API | serves the CLI and the TUI | "HTTP API" |
+| gRPC endpoint | the stream of each worker and the log stream | "Master–worker protocol" |
+| alarm | one timerfd armed on the next deadline (on Linux; on macOS a check at least once a minute) | "How the master wakes up" |
+| log store | one file per attempt on disk, outside SQLite | "Logs" |
+| alerts | optional webhook for stuck tasks and failed runs | "Alerts" |
 
 The master keeps its state in memory and wakes only when an event occurs. Every change is written to the database. The database is read to take decisions only at startup and when a scheduled time arrives; all other reads serve the API, for history.
 
@@ -234,7 +249,7 @@ attempts/<run>/<task>/<attempt>/
   shim.lock      held while the shim     locked by the shim for its whole life
                  is alive
   started.json   the process started     written by the shim
-  log            the output              written by the shim, shipped by the worker
+  log.<offset>   the output, in segments written by the shim, shipped and deleted by the worker
   cancel         a request to stop       created by the worker
   exit.json      how the task ended      written by the shim, last
 ```
@@ -520,7 +535,7 @@ lwwo rerun <run> --current            # with the current version, if the structu
 ```
 
 - A rerun uses the DAG version the run started with. The current version can be used only when its structure is identical, that is, the same tasks and dependencies; otherwise a new run is required.
-- A reopened run is subject to the overlap rule like a new run. It is not queued, however: while another run of the DAG is active the rerun is refused and must be requested again (a known limitation, see [status.md](status.md)).
+- A reopened run is subject to the overlap rule like a new run. With `queue` or `allow`, when there is no room, or other runs of the DAG are already waiting, the run becomes `queued` behind them: the request, the version and the previous state are stored in `dag_runs.rerun`, and the run reopens when its turn comes. With `skip` the rerun is refused; with `replace` the active runs are cancelled. Cancelling a run that waits to be rerun returns it to its previous state. If, when its turn comes, nothing is left to run, the run returns to its previous state and the master logs why.
 - "Rerun failed" also includes cancelled tasks, so a cancelled run can be completed.
 - Only a finished run can be rerun. The retries of rerun tasks start from zero; attempt numbers continue.
 - A task that depends on a task still failed does not run: it remains skipped.
@@ -545,7 +560,7 @@ The orchestrator launches tasks and collects their outcomes; data and secrets re
 Task logs are stored on the master, which is the only place clients read them from. Each attempt has its own log, from the first line to the last, and it moves in three steps:
 
 ```text
-task ─ stdout, stderr ─▶ shim ─ lines ─▶ spool file on the worker ─ chunks ─▶ master: one file per attempt
+task ─ stdout, stderr ─▶ shim ─ lines ─▶ spool on the worker ─ chunks ─▶ master: one file per attempt
                                          attempts/…/log           ◀─ ack: bytes held ─┘ logs/<dag>/<run>/<task>/<n>.log
 ```
 
@@ -564,7 +579,7 @@ The shim, not the task, writes every line, and every line has the same three fie
 | --- | --- |
 | `O` | the task's standard output |
 | `E` | the task's standard error |
-| `S` | lwwo itself: why the task was stopped (`timeout: stopping the task`, `cancelled: stopping the task`, `the worker has been away too long: stopping the task`), an error that prevented the start, and the notice that the spool limit was reached |
+| `S` | lwwo itself: why the task was stopped (`timeout: stopping the task`, `cancelled: stopping the task`, `the worker has been away too long: stopping the task`) and an error that prevented the start |
 
 - **The time is when the shim read the line,** in UTC milliseconds by the worker's clock. It is not a time the task printed, and it is not corrected for clock differences between machines.
 - **A line ends at `\n`.** The trailing `\n` or `\r\n` is removed, and the shim adds its own `\n`. Output that ends without a newline becomes a last line when the stream closes.
@@ -574,15 +589,17 @@ The shim, not the task, writes every line, and every line has the same three fie
 
 ### On the worker: the spool
 
-- The spool is the `log` file in the attempt's journal directory (see "Surviving a worker restart"). The shim appends to it; the worker reads it and ships it.
-- **Limit:** `log_spool_max` (1 GB by default). The shim writes a line only if the file stays within the limit. The first line that would exceed it is replaced by one `S` line, `the output is over log_spool_max: the rest is dropped`, and every later line of the attempt is discarded. The file is therefore at most `log_spool_max` plus that one line. The task itself keeps running.
-- The file is deleted when the master has acknowledged every byte of it and the attempt has ended.
+- **Segments.** The spool is a set of files in the attempt's journal directory (see "Surviving a worker restart"), each named `log.<offset>` after the position of its first byte in the output: `log.0`, then for example `log.536870912`. The shim appends whole lines to the newest segment and never splits a line between two. The first segment grows to half of `log_spool_max`, every later one to an eighth of it; a line that does not fit starts a new segment.
+- **Deleted once received.** After each acknowledgement the worker deletes every segment whose bytes the master holds entirely, except the newest, which the shim may still be writing. The limit therefore counts only the output the master does not yet have.
+- **Limit:** `log_spool_max` (1 GB by default). Before writing a line that would bring the segments on disk over the limit, the shim deletes the oldest segment other than `log.0` and the newest, as many times as needed. The beginning and the most recent output stay; the deleted bytes never reach the master, which marks the gap (see "Shipping"). A single line longer than the room left is written anyway. The task itself keeps running.
+- The remaining segments are deleted when the master has acknowledged every byte and the attempt has ended.
 
 ### Shipping
 
 - **Chunks** travel on the `Logs` stream: run, task, attempt, DAG, the byte offset of the chunk, at most 64 KiB of data, and a `last` flag. The worker has at most one unacknowledged chunk per attempt.
-- **Acknowledgement:** the master answers each chunk with the number of bytes of that attempt it holds. A chunk is appended only if its offset equals that number; otherwise it is ignored and the worker continues from the number it is told. No byte is written twice or skipped.
-- **While the master is unreachable** the spool keeps growing on the worker. The worker reopens the stream every 2 seconds and, once it is open, resends from the last acknowledged byte. After a master restart the master reads how many bytes it has from its files on disk.
+- **Acknowledgement:** the master answers each chunk with the position up to which it holds the output of that attempt. A chunk whose offset is lower is ignored and the worker continues from the position it is told, so no byte is written twice.
+- **Gaps.** When the bytes after the acknowledged position are no longer in the spool, the worker sends from the first segment it still has, with that segment's offset. The master accepts a chunk whose offset is higher than its position: the bytes in between count as dropped, the beginning of the log is closed even if it is shorter than half of `max_per_attempt`, and the chunk goes to the end of the log, after the line `[lwwo: log over the limit, middle part dropped]`.
+- **While the master is unreachable** the spool keeps growing on the worker, up to its limit. The worker reopens the stream every 2 seconds and, once it is open, resends from the last acknowledged position. After a master restart the master computes its position from its files on disk and from `<attempt>.skipped`, which records the bytes it does not hold: those dropped in a gap and those of discarded `.tail` files.
 - **The outcome follows the log.** The worker sends `Report` only after the master has acknowledged the last chunk, which carries `last`. The master therefore saves the outcome when the log is already complete.
 - A chunk for an attempt whose log is already closed is acknowledged and discarded.
 

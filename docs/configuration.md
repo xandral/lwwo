@@ -150,7 +150,7 @@ The worker file has no sections.
 | `min_free_disk` | `10%` | With less free disk the worker takes no new tasks (running ones go on). |
 | `min_free_memory` | `10%` | The same for memory. |
 | `kill_grace` | `30s` | To stop a task the worker sends SIGTERM to its whole process group, and SIGKILL after this long. |
-| `log_spool_max` | `1GB` | Limit of the output kept per attempt on the worker until the master has it. Above it the rest of the output is dropped, with a line that says so. |
+| `log_spool_max` | `1GB` | Limit of the output kept per attempt on the worker until the master has it. Above it the beginning and the most recent output are kept, and the master marks the part in between as dropped. |
 | `cgroups` | `auto` | Linux only. Each task in a cgroup of its own, so its whole process tree can be stopped and its peak memory measured. `auto`: only when the worker's cgroup holds lwwo alone (a systemd service, a container). `on`: always; whatever shares the worker's cgroup is moved. `off`: never. |
 
 ### Example

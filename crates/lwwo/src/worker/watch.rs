@@ -2,8 +2,8 @@
 //! journal of the attempt.
 //!
 //! The worker never holds the process of a task. It writes what to run,
-//! starts `lwwo shim` on it and from then on only reads files: `log` to
-//! send the output, `started.json` and `exit.json` to report. A worker
+//! starts `lwwo shim` on it and from then on only reads files: the spool
+//! to send the output, `started.json` and `exit.json` to report. A worker
 //! that starts finds the attempts of the one before it in the same
 //! directories and picks them up where they are.
 
@@ -207,7 +207,7 @@ pub(crate) async fn follow(
     let key = spec.key();
     shared
         .shipper
-        .track(key.clone(), spec.dag.clone(), dir.join("log"));
+        .track(key.clone(), spec.dag.clone(), dir.clone());
     // Watched before the first look, so no change is missed in between.
     let watch = shared.wakeups.watch(&dir);
     let mut told_started = false;

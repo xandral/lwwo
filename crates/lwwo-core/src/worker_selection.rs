@@ -385,6 +385,13 @@ mod tests {
     // Already working
 
     #[test]
+    fn tasks_started_together_spread_over_unequal_workers() {
+        let mut pool = pool(vec![(0, worker(2, 0, &[])), (1, worker(4, 0, &["big"]))]);
+        let chosen: Vec<WorkerId> = (0..3).map(|_| pool.select(1, &[]).unwrap()).collect();
+        assert_eq!(chosen, [w(1), w(0), w(1)]);
+    }
+
+    #[test]
     fn adding_the_same_worker_twice_is_an_error() {
         let mut pool = pool(vec![(1, worker(4, 0, &[]))]);
         assert_eq!(

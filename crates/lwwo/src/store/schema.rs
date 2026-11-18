@@ -99,6 +99,8 @@ CREATE TABLE tokens (
 ",
     // 2: why the engine stopped a run it could no longer trust.
     "ALTER TABLE dag_runs ADD COLUMN problem TEXT;",
+    // 3: a finished run waiting to run again, until there is room.
+    "ALTER TABLE dag_runs ADD COLUMN rerun TEXT;",
 ];
 
 /// Brings the database to the latest schema.

@@ -39,8 +39,9 @@ struct Open {
     head: u64,
     /// Bytes in the current tail file.
     tail: u64,
-    /// Whether an older tail was thrown away.
-    dropped: bool,
+    /// Bytes of the output that are not on disk: older tails thrown away,
+    /// and bytes the worker's spool dropped before sending them.
+    skipped: u64,
     /// Size and truncation, once the log is closed.
     done: Option<(u64, bool)>,
 }
@@ -100,6 +101,12 @@ impl LogStore {
         self.base(key).with_extension("tail.old")
     }
 
+    /// How many bytes are not on disk, once some are not: with it, a
+    /// restarted master knows where the output it has ends.
+    fn skipped_path(&self, key: &LogKey) -> PathBuf {
+        self.base(key).with_extension("skipped")
+    }
+
     /// The whole log, once the attempt is over.
     fn closed_path(&self, key: &LogKey) -> PathBuf {
         self.base(key).with_extension("log")
@@ -107,9 +114,11 @@ impl LogStore {
 
     /// Appends a chunk that starts at `offset` of the attempt's output and
     /// returns how many bytes the master now has, for the acknowledgement.
-    /// A chunk that does not start where the log ends is not written: the
-    /// worker continues from the returned position. With `last` the log is
-    /// closed.
+    /// A chunk that starts before the end of the log is not written: the
+    /// worker continues from the returned position. One that starts after
+    /// it means the worker no longer has the bytes in between: they count
+    /// as dropped, and what follows goes to the end of the log, after the
+    /// mark. With `last` the log is closed.
     pub(crate) fn append(
         &self,
         key: &LogKey,
@@ -127,8 +136,12 @@ impl LogStore {
             } else {
                 state.head = file_len(&self.head_path(key));
                 state.tail = file_len(&self.tail_path(key));
-                state.dropped = self.old_tail_path(key).exists();
-                state.received = state.head + state.tail;
+                state.skipped = fs::read_to_string(self.skipped_path(key))
+                    .ok()
+                    .and_then(|text| text.trim().parse().ok())
+                    .unwrap_or(0);
+                state.received =
+                    state.head + file_len(&self.old_tail_path(key)) + state.tail + state.skipped;
             }
             open.insert(key.clone(), state);
         }
@@ -138,16 +151,25 @@ impl LogStore {
             // Closed already: tell the worker it can forget the rest.
             return Ok(end.max(state.received));
         }
-        if offset != state.received {
+        if offset < state.received {
             return Ok(state.received);
+        }
+        fs::create_dir_all(self.base(key).parent().expect("logs have a directory"))?;
+        if offset > state.received {
+            state.skipped += offset - state.received;
+            state.received = offset;
+            self.save_skipped(key, state.skipped)?;
         }
 
         if !data.is_empty() {
-            fs::create_dir_all(self.base(key).parent().expect("logs have a directory"))?;
             let half = self.max / 2;
-            let to_head = usize::try_from(half.saturating_sub(state.head))
-                .unwrap_or(usize::MAX)
-                .min(data.len());
+            // After a gap the beginning is over: the mark goes after it.
+            let room = if state.skipped > 0 {
+                0
+            } else {
+                half.saturating_sub(state.head)
+            };
+            let to_head = usize::try_from(room).unwrap_or(usize::MAX).min(data.len());
             if to_head > 0 {
                 append(&self.head_path(key), &data[..to_head])?;
                 state.head += to_head as u64;
@@ -157,9 +179,10 @@ impl LogStore {
                 if state.tail > half {
                     // Two tail files of half the limit each always hold the
                     // last half; anything older goes.
+                    state.skipped += file_len(&self.old_tail_path(key));
+                    self.save_skipped(key, state.skipped)?;
                     fs::rename(self.tail_path(key), self.old_tail_path(key))?;
                     state.tail = 0;
-                    state.dropped = true;
                 }
                 append(&self.tail_path(key), rest)?;
                 state.tail += rest.len() as u64;
@@ -167,11 +190,18 @@ impl LogStore {
             state.received = end;
         }
         if last {
-            state.done = Some(self.close(key, state.dropped)?);
+            state.done = Some(self.close(key, state.skipped > 0)?);
         }
         drop(open);
         self.grew.notify_waiters();
         Ok(end)
+    }
+
+    fn save_skipped(&self, key: &LogKey, skipped: u64) -> io::Result<()> {
+        let path = self.skipped_path(key);
+        let temporary = path.with_extension("skipped.tmp");
+        fs::write(&temporary, skipped.to_string())?;
+        fs::rename(temporary, path)
     }
 
     /// Closes a log: the file that was being written becomes the log. If
@@ -215,7 +245,7 @@ impl LogStore {
             File::create(&head)?;
         }
         fs::rename(&head, self.closed_path(key))?;
-        for part in tails {
+        for part in tails.into_iter().chain([self.skipped_path(key)]) {
             let _ = fs::remove_file(part);
         }
         Ok((file_len(&self.closed_path(key)), truncated))
@@ -229,7 +259,7 @@ impl LogStore {
             Some(state) if state.done.is_some() => open.remove(key).and_then(|state| state.done),
             Some(_) => {
                 // The attempt ended without closing its log: close it now.
-                let dropped = open.remove(key).is_some_and(|state| state.dropped);
+                let dropped = open.remove(key).is_some_and(|state| state.skipped > 0);
                 self.close(key, dropped).ok()
             }
             None => None,
@@ -290,9 +320,8 @@ mod tests {
         let (logs, dir) = store(1 << 20);
         assert_eq!(logs.append(&key(), 0, b"one\n", false).unwrap(), 4);
         assert_eq!(logs.read(&key(), 0).unwrap(), (b"one\n".to_vec(), false));
-        // The same chunk again, and one from the future: neither is written.
+        // The same chunk again is not written.
         assert_eq!(logs.append(&key(), 0, b"one\n", false).unwrap(), 4);
-        assert_eq!(logs.append(&key(), 9, b"lost\n", false).unwrap(), 4);
         assert_eq!(logs.append(&key(), 4, b"two\n", true).unwrap(), 8);
 
         assert_eq!(
@@ -355,6 +384,42 @@ mod tests {
             }
             assert_eq!(sizes, [piece, piece, 10]);
         }
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn bytes_the_worker_dropped_are_marked_where_they_were() {
+        let (logs, dir) = store(1 << 20);
+        assert_eq!(logs.append(&key(), 0, b"first\n", false).unwrap(), 6);
+        // The worker's spool lost bytes 6 to 100.
+        assert_eq!(logs.append(&key(), 100, b"last\n", true).unwrap(), 105);
+        let text = String::from_utf8(logs.read(&key(), 0).unwrap().0).unwrap();
+        assert_eq!(
+            text,
+            "first\n\n[lwwo: log over the limit, middle part dropped]\nlast\n"
+        );
+        assert!(logs.take_stats(&key()).unwrap().1, "truncated");
+        assert!(!dir.join("etl/r1/clean/2.skipped").exists());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_restarted_master_knows_where_a_long_log_ends() {
+        let (logs, dir) = store(200);
+        let mut offset = 0;
+        for i in 0..100 {
+            let line = format!("line {i:03}\n");
+            offset = logs.append(&key(), offset, line.as_bytes(), false).unwrap();
+        }
+        assert_eq!(offset, 900);
+        let restarted = LogStore::new(dir.clone(), 200);
+        assert_eq!(restarted.append(&key(), 0, b"", false).unwrap(), 900);
+        assert_eq!(
+            restarted.append(&key(), 900, b"line 100\n", true).unwrap(),
+            909
+        );
+        let text = String::from_utf8(restarted.read(&key(), 0).unwrap().0).unwrap();
+        assert!(text.ends_with("line 099\nline 100\n"), "{text}");
         fs::remove_dir_all(dir).unwrap();
     }
 

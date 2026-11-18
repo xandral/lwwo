@@ -5,7 +5,7 @@
 //! orphan them and lose their outcome. So the worker does not run tasks:
 //! for each attempt it starts `lwwo shim <directory>` and forgets it. The
 //! shim reads what to do from the attempt's journal, runs the task, writes
-//! its output to a file, enforces its timeout, and at the end writes how
+//! its output to the spool, enforces its timeout, and at the end writes how
 //! it went. The worker only looks at files, so it can come and go.
 //!
 //! This is what `containerd-shim` and `conmon` do for containers. The shim
@@ -18,12 +18,13 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, ensure};
 use rustix::process::{Pid, Signal, kill_process_group};
-use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::{mpsc, watch};
 
 use super::cgroup::Cgroup;
 use super::journal::{self, Exit, Spec, Started};
+use super::spool::Writer;
 use crate::util::now_ms;
 
 /// How often the shim looks for a request to stop.
@@ -40,9 +41,9 @@ enum Stop {
     Orphaned,
 }
 
-/// Where the output of an attempt goes: the `log` file of its journal,
-/// which the worker sends to the master. One line of output is one line of
-/// the file: milliseconds, stream (`O`ut, `E`rr or `S`ystem) and text.
+/// Where the output of an attempt goes: the spool in its journal, which
+/// the worker sends to the master. One line of output is one line of the
+/// spool: milliseconds, stream (`O`ut, `E`rr or `S`ystem) and text.
 #[derive(Debug, Clone)]
 struct Output {
     lines: mpsc::UnboundedSender<String>,
@@ -307,44 +308,13 @@ pub(crate) async fn run(dir: &Path) -> Result<()> {
     // One writer for the log, fed by stdout, stderr and lwwo itself.
     let (lines, mut written) = mpsc::unbounded_channel::<String>();
     let output = Output { lines };
-    let log = dir.join("log");
-    let log_max = spec.log_max;
-    let writer = tokio::spawn(async move {
-        let file = tokio::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&log)
-            .await;
-        let Ok(mut file) = file else {
-            return;
-        };
-        // A task that writes without end must not fill the worker's disk:
-        // past `log_spool_max` the rest of its output is dropped.
-        let mut size: u64 = 0;
-        let mut full = false;
-        while let Some(first) = written.recv().await {
-            let mut lines = vec![first];
-            // Take what else is ready before flushing.
-            while let Ok(line) = written.try_recv() {
-                lines.push(line);
-            }
-            for line in lines {
-                if full {
-                    continue;
-                }
-                if size.saturating_add(line.len() as u64) > log_max {
-                    full = true;
-                    let mark = format!(
-                        "{}\tS\tthe output is over log_spool_max: the rest is dropped\n",
-                        now_ms()
-                    );
-                    let _ = file.write_all(mark.as_bytes()).await;
-                    continue;
-                }
-                size += line.len() as u64;
-                let _ = file.write_all(line.as_bytes()).await;
-            }
-            let _ = file.flush().await;
+    let mut log = Writer::new(dir, spec.log_max);
+    // Plain file writes, on a thread of their own.
+    let writer = tokio::task::spawn_blocking(move || {
+        while let Some(line) = written.blocking_recv() {
+            // A segment that cannot be written loses the line, not the
+            // task.
+            let _ = log.line(line.as_bytes());
         }
     });
 

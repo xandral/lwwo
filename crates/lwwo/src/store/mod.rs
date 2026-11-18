@@ -472,7 +472,7 @@ impl Store {
     /// A finished run is running again.
     pub(crate) fn reopen_run(&self, run: &str) -> Result<()> {
         self.conn.execute(
-            "UPDATE dag_runs SET state = 'running', finished_at = NULL, problem = NULL
+            "UPDATE dag_runs SET state = 'running', finished_at = NULL, problem = NULL, rerun = NULL
              WHERE id = ?1",
             [run],
         )?;
@@ -486,6 +486,36 @@ impl Store {
         self.conn.execute(
             "UPDATE dag_runs SET problem = ?2 WHERE id = ?1",
             params![run, problem],
+        )?;
+        Ok(())
+    }
+
+    /// A finished run waits to run again: it is `queued`, with the request
+    /// as JSON, until there is room for it.
+    pub(crate) fn queue_rerun(&self, run: &str, request: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE dag_runs SET state = 'queued', rerun = ?2 WHERE id = ?1",
+            params![run, request],
+        )?;
+        Ok(())
+    }
+
+    /// The request of a run waiting to run again; `None` for any other run.
+    pub(crate) fn rerun_request(&self, run: &str) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row("SELECT rerun FROM dag_runs WHERE id = ?1", [run], |row| {
+                row.get(0)
+            })
+            .optional()?
+            .flatten())
+    }
+
+    /// A run that waited to run again will not: it goes back to `state`.
+    pub(crate) fn drop_rerun(&self, run: &str, state: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE dag_runs SET state = ?2, rerun = NULL WHERE id = ?1",
+            params![run, state],
         )?;
         Ok(())
     }
@@ -821,6 +851,28 @@ mod tests {
             finished_at: None,
             problem: None,
         }
+    }
+
+    #[test]
+    fn a_finished_run_can_wait_to_run_again() {
+        let store = store_with_dag();
+        store.insert_run(&run("r1", 100, "manual")).unwrap();
+        store.finish_run("r1", "failed", 200).unwrap();
+        assert_eq!(store.rerun_request("r1").unwrap(), None);
+
+        store.queue_rerun("r1", "{}").unwrap();
+        assert_eq!(store.run("r1").unwrap().unwrap().state, "queued");
+        assert_eq!(store.rerun_request("r1").unwrap().as_deref(), Some("{}"));
+        assert_eq!(store.open_runs().unwrap().len(), 1, "open until it runs");
+
+        store.drop_rerun("r1", "failed").unwrap();
+        assert_eq!(store.run("r1").unwrap().unwrap().state, "failed");
+        assert_eq!(store.rerun_request("r1").unwrap(), None);
+
+        store.queue_rerun("r1", "{}").unwrap();
+        store.reopen_run("r1").unwrap();
+        assert_eq!(store.run("r1").unwrap().unwrap().state, "running");
+        assert_eq!(store.rerun_request("r1").unwrap(), None);
     }
 
     #[test]

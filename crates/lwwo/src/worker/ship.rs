@@ -1,14 +1,14 @@
 //! Sending task output to the master.
 //!
-//! Every attempt writes its output to a file on the worker's disk, the
-//! spool. The shipper reads those files and sends them in chunks on the
-//! `Logs` stream, one chunk per file at a time, each acknowledged with the
-//! number of bytes the master has. If the master is away the files simply
-//! grow, and shipping continues from the last acknowledged byte when it is
-//! back: no line is lost, and none is sent to the master's file twice.
+//! Every attempt writes its output to the worker's disk, the spool (see
+//! [`super::spool`]). The shipper reads it and sends it in chunks on the
+//! `Logs` stream, one chunk per attempt at a time, each acknowledged with
+//! the number of bytes the master has; what the master has is deleted. If
+//! the master is away the spool grows, and shipping continues from the
+//! last acknowledged byte when it is back: no line is sent to the master's
+//! file twice, and none is lost unless the spool went over its limit.
 
 use std::collections::HashMap;
-use std::io::{Read, Seek, SeekFrom};
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -18,6 +18,7 @@ use tonic::Streaming;
 use tracing::debug;
 
 use super::Connect;
+use super::spool;
 use crate::proto;
 
 /// The most bytes in one chunk.
@@ -27,12 +28,8 @@ const CHUNK: usize = 64 * 1024;
 pub(crate) type Key = (String, String, u32);
 
 enum Message {
-    /// A new attempt writes to `path`.
-    Track {
-        key: Key,
-        dag: String,
-        path: PathBuf,
-    },
+    /// A new attempt writes to the spool in `dir`.
+    Track { key: Key, dag: String, dir: PathBuf },
     /// Some file grew.
     Grew,
     /// The attempt wrote its last line; `done` fires when the master has
@@ -46,7 +43,8 @@ pub(crate) struct Shipper(mpsc::UnboundedSender<Message>);
 
 struct File {
     dag: String,
-    path: PathBuf,
+    /// The attempt's directory, where its spool is.
+    dir: PathBuf,
     /// Bytes the master has.
     acked: u64,
     /// A chunk is on its way and not yet acknowledged.
@@ -62,15 +60,9 @@ impl File {
         if self.waiting {
             return None;
         }
-        let mut data = Vec::new();
-        let mut len = self.acked;
-        if let Ok(mut file) = std::fs::File::open(&self.path) {
-            len = file.metadata().map_or(self.acked, |meta| meta.len());
-            if file.seek(SeekFrom::Start(self.acked)).is_ok() {
-                let _ = file.take(CHUNK as u64).read_to_end(&mut data);
-            }
-        }
-        let last = self.complete.is_some() && self.acked + data.len() as u64 >= len;
+        // Past the acknowledged byte if the spool dropped what follows it.
+        let (offset, data, end) = spool::read(&self.dir, self.acked, CHUNK);
+        let last = self.complete.is_some() && offset + data.len() as u64 >= end;
         if data.is_empty() && !last {
             return None;
         }
@@ -83,7 +75,7 @@ impl File {
                 attempt: key.2,
             }),
             dag: self.dag.clone(),
-            offset: self.acked,
+            offset,
             data,
             last,
         })
@@ -98,9 +90,9 @@ impl Shipper {
         Self(tx)
     }
 
-    /// Starts shipping the file an attempt writes to.
-    pub(crate) fn track(&self, key: Key, dag: String, path: PathBuf) {
-        let _ = self.0.send(Message::Track { key, dag, path });
+    /// Starts shipping the spool of an attempt.
+    pub(crate) fn track(&self, key: Key, dag: String, dir: PathBuf) {
+        let _ = self.0.send(Message::Track { key, dag, dir });
     }
 
     /// Says that a tracked file grew.
@@ -165,8 +157,8 @@ async fn run(connect: Connect, mut rx: mpsc::UnboundedReceiver<Message>) {
         };
         tokio::select! {
             message = rx.recv() => match message {
-                Some(Message::Track { key, dag, path }) => {
-                    files.insert(key, File { dag, path, acked: 0, waiting: false, closing: false, complete: None });
+                Some(Message::Track { key, dag, dir }) => {
+                    files.insert(key, File { dag, dir, acked: 0, waiting: false, closing: false, complete: None });
                 }
                 Some(Message::Grew) => {}
                 Some(Message::Complete { key, done }) => match files.get_mut(&key) {
@@ -191,11 +183,12 @@ async fn run(connect: Connect, mut rx: mpsc::UnboundedReceiver<Message>) {
                     file.acked = ack.received;
                     file.waiting = false;
                     file.closing = false;
-                    let len = std::fs::metadata(&file.path).map_or(0, |meta| meta.len());
-                    if was_closing && ack.received >= len {
+                    spool::forget_received(&file.dir, ack.received);
+                    let end = spool::segments(&file.dir).last().map_or(0, spool::Segment::end);
+                    if was_closing && ack.received >= end {
                         // The master has it all and closed its file.
                         if let Some(file) = files.remove(&key) {
-                            let _ = std::fs::remove_file(&file.path);
+                            spool::remove(&file.dir);
                             if let Some(done) = file.complete {
                                 let _ = done.send(());
                             }

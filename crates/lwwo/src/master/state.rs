@@ -83,6 +83,19 @@ pub(crate) struct RerunRequest {
     pub(crate) current: bool,
 }
 
+/// A rerun waiting for room, as stored in `dag_runs.rerun`.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct QueuedRerun {
+    task: Option<String>,
+    all: bool,
+    only: bool,
+    /// The version to run with, chosen when the rerun was asked for.
+    version: String,
+    /// The state of the run before: it goes back to it if the rerun does
+    /// not happen.
+    was: String,
+}
+
 /// A request to the master, from the API or from the gRPC service.
 #[derive(Debug)]
 pub(crate) enum Call {
@@ -951,6 +964,9 @@ impl Master {
         if row.state != "queued" {
             return Ok(());
         }
+        if let Some(rerun) = self.store.rerun_request(&row.id)? {
+            return self.start_queued_rerun(row, &rerun);
+        }
         let Some(run) = parse_run_id(&row.id) else {
             return Ok(());
         };
@@ -1705,11 +1721,19 @@ impl Master {
                 self.engine_event(Event::CancelRun { run })?;
             }
             ("queued", _) => {
-                self.store.finish_run(&row.id, "cancelled", now_ms())?;
                 if let Some(queue) = self.queued.get_mut(&row.dag_name) {
                     queue.retain(|queued| *queued != row.id);
                 }
                 self.dirty = true;
+                if let Some(rerun) = self.store.rerun_request(&row.id)? {
+                    // A finished run that waited to run again stays as it
+                    // was.
+                    let was = serde_json::from_str::<QueuedRerun>(&rerun)
+                        .map_or_else(|_| "failed".to_owned(), |queued| queued.was);
+                    self.store.drop_rerun(&row.id, &was)?;
+                    return Ok(json!({ "id": row.id, "state": was }));
+                }
+                self.store.finish_run(&row.id, "cancelled", now_ms())?;
             }
             _ => {
                 return Err(ApiError::conflict(format!(
@@ -1722,68 +1746,120 @@ impl Master {
     }
 
     fn rerun(&mut self, id: &str, request: &RerunRequest) -> ApiResult {
-        let row = self.existing_run(id)?;
+        let mut row = self.existing_run(id)?;
         if matches!(row.state.as_str(), "queued" | "running") {
             return Err(ApiError::conflict(format!(
                 "run {} is {}: only a finished run can be run again",
                 row.id, row.state
             )));
         }
-        let run = parse_run_id(&row.id).context("the id is not a UUID")?;
-
-        // The version of the run, or the current one if it has the same
-        // tasks and dependencies.
-        let mut hash = row.version_hash.clone();
-        if request.current {
-            let dag = self.existing_dag(&row.dag_name)?;
-            if dag.current != hash {
-                let old = self
-                    .store
-                    .version(&hash)?
-                    .context("the run's version is gone")?;
-                let new = self
-                    .store
-                    .version(&dag.current)?
-                    .context("the current version is gone")?;
-                if old.structure != new.structure {
-                    return Err(ApiError::conflict(
-                        "the current version has different tasks or dependencies: start a new run",
-                    ));
-                }
-                hash = dag.current;
-            }
-        }
-        let loaded = self.load_version(&hash)?;
-
-        let scope = match (&request.task, request.all) {
-            (Some(name), _) => {
-                let task = *loaded.ids.get(name).ok_or_else(|| {
-                    ApiError::not_found(format!("run {} has no task `{name}`", row.id))
-                })?;
-                Rerun::Task {
-                    task,
-                    downstream: !request.only,
-                }
-            }
-            (None, true) => Rerun::All,
-            (None, false) => Rerun::Failed,
-        };
+        row.version_hash = self.rerun_version(&row, request)?;
+        let loaded = self.load_version(&row.version_hash)?;
+        let scope = rerun_scope(&row, &loaded, request)?;
 
         // A reopened run follows the overlap rule like a new one.
         let overlap = loaded.dag.overlap(&self.config.defaults);
-        if !self.has_room(&row.dag_name, overlap) {
-            if overlap == Overlap::Replace {
-                for active in self.active(&row.dag_name) {
-                    self.engine_event(Event::CancelRun { run: active })?;
+        let dag = row.dag_name.clone();
+        let waiting = self.queued.get(&dag).is_some_and(|queue| !queue.is_empty());
+        if !self.has_room(&dag, overlap) || waiting {
+            match overlap {
+                Overlap::Skip => {
+                    return Err(ApiError::conflict(format!(
+                        "a run of `{dag}` is active and its overlap rule is `skip`"
+                    )));
                 }
-            } else {
-                return Err(ApiError::conflict(format!(
-                    "another run of `{}` is active: run this one again when it ends",
-                    row.dag_name
-                )));
+                Overlap::Replace => {
+                    for active in self.active(&dag) {
+                        self.engine_event(Event::CancelRun { run: active })?;
+                    }
+                }
+                Overlap::Queue | Overlap::Allow { .. } => {
+                    let queued = QueuedRerun {
+                        task: request.task.clone(),
+                        all: request.all,
+                        only: request.only,
+                        version: row.version_hash.clone(),
+                        was: row.state.clone(),
+                    };
+                    let queued = serde_json::to_string(&queued).map_err(anyhow::Error::from)?;
+                    self.store.queue_rerun(&row.id, &queued)?;
+                    self.queued
+                        .entry(dag)
+                        .or_default()
+                        .push_back(row.id.clone());
+                    self.dirty = true;
+                    info!("run {} of {} waits to run again", row.id, row.dag_name);
+                    return Ok(json!({ "id": row.id, "state": "queued" }));
+                }
             }
         }
+        self.reopen(&row, loaded, scope)
+    }
 
+    /// The version a rerun runs with: the run's own, or with `current` the
+    /// DAG's current one if it has the same tasks and dependencies.
+    fn rerun_version(&self, row: &RunRow, request: &RerunRequest) -> Result<String, ApiError> {
+        if !request.current {
+            return Ok(row.version_hash.clone());
+        }
+        let dag = self.existing_dag(&row.dag_name)?;
+        if dag.current == row.version_hash {
+            return Ok(dag.current);
+        }
+        let old = self
+            .store
+            .version(&row.version_hash)?
+            .context("the run's version is gone")?;
+        let new = self
+            .store
+            .version(&dag.current)?
+            .context("the current version is gone")?;
+        if old.structure != new.structure {
+            return Err(ApiError::conflict(
+                "the current version has different tasks or dependencies: start a new run",
+            ));
+        }
+        Ok(dag.current)
+    }
+
+    /// A rerun that waited in the queue starts now, or goes back to the
+    /// state of its run if there is nothing left to run.
+    fn start_queued_rerun(&mut self, mut row: RunRow, text: &str) -> Result<()> {
+        let queued: QueuedRerun =
+            serde_json::from_str(text).context("the queued rerun cannot be read")?;
+        let request = RerunRequest {
+            task: queued.task.clone(),
+            all: queued.all,
+            only: queued.only,
+            current: false,
+        };
+        row.version_hash.clone_from(&queued.version);
+        let started = self
+            .load_version(&row.version_hash)
+            .map_err(ApiError::from)
+            .and_then(|loaded| {
+                let scope = rerun_scope(&row, &loaded, &request)?;
+                self.reopen(&row, loaded, scope)
+            });
+        match started {
+            Ok(_) => Ok(()),
+            Err(error) if error.status >= 500 => Err(anyhow::anyhow!(error.message)),
+            Err(error) => {
+                warn!(
+                    "run {} of {} does not run again: {}",
+                    row.id, row.dag_name, error.message
+                );
+                self.store.drop_rerun(&row.id, &queued.was)?;
+                self.dirty = true;
+                Ok(())
+            }
+        }
+    }
+
+    /// Reopens a finished run on `row.version_hash` and starts what
+    /// `scope` selects.
+    fn reopen(&mut self, row: &RunRow, loaded: Arc<Loaded>, scope: Rerun) -> ApiResult {
+        let run = parse_run_id(&row.id).context("the id is not a UUID")?;
         let saved = self.store.tasks(&row.id)?;
         let mut tasks = Vec::with_capacity(loaded.graph.len());
         for task in loaded.graph.tasks() {
@@ -1806,9 +1882,7 @@ impl Master {
         }
         let graph = Arc::clone(&loaded.graph);
         let params = serde_json::from_str(&row.params).unwrap_or_default();
-        let mut reopened = row.clone();
-        reopened.version_hash = hash;
-        self.open_run(run, &reopened, loaded, params);
+        self.open_run(run, row, loaded, params);
         let any = self.engine_event(Event::RerunRun {
             run,
             graph,
@@ -2123,6 +2197,23 @@ pub(crate) async fn call(tx: &mpsc::Sender<Msg>, call: Call) -> ApiResult {
 /// Whether an error comes from the database. Those stop the master: a
 /// master that cannot write cannot promise anything. Any other error is
 /// about one DAG or one run, and stops only that.
+/// Which tasks a rerun selects.
+fn rerun_scope(row: &RunRow, loaded: &Loaded, request: &RerunRequest) -> Result<Rerun, ApiError> {
+    Ok(match (&request.task, request.all) {
+        (Some(name), _) => {
+            let task = *loaded.ids.get(name).ok_or_else(|| {
+                ApiError::not_found(format!("run {} has no task `{name}`", row.id))
+            })?;
+            Rerun::Task {
+                task,
+                downstream: !request.only,
+            }
+        }
+        (None, true) => Rerun::All,
+        (None, false) => Rerun::Failed,
+    })
+}
+
 fn is_storage(error: &anyhow::Error) -> bool {
     error
         .chain()

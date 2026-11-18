@@ -524,6 +524,50 @@ fn overlap_queue_makes_a_second_run_wait() {
 }
 
 #[test]
+fn a_rerun_waits_for_the_active_run() {
+    let lab = Lab::new("queued-rerun");
+    let _master = lab.standalone(&[]);
+    let hold = lab.dir.join("hold");
+    let pass = lab.dir.join("pass");
+    lab.apply(&format!(
+        "name: careful\ntasks:\n  work:\n    run: [sh, -c, 'if [ -e {0} ]; then sleep 4; fi; test -e {1}']\n",
+        hold.display(),
+        pass.display()
+    ));
+    let failed = lab.run("careful", &[]);
+    assert_eq!(lab.finished(&failed), "failed");
+
+    std::fs::write(&hold, "").unwrap();
+    let active = lab.run("careful", &[]);
+    std::fs::write(&pass, "").unwrap();
+
+    // Asked while another run is active: it waits, and a cancel leaves
+    // the run as it was.
+    assert!(lab.cli(&["rerun", &failed]).contains("queued"));
+    assert_eq!(lab.run_state(&failed), "queued");
+    assert!(lab.cli(&["cancel", &failed]).contains("failed"));
+    assert_eq!(lab.run_state(&failed), "failed");
+
+    assert!(lab.cli(&["rerun", &failed]).contains("queued"));
+    assert_eq!(lab.run_state(&active), "running");
+    assert_eq!(lab.finished(&active), "success");
+    assert_eq!(lab.finished(&failed), "success");
+    assert_eq!(lab.task(&failed, "work")["attempts"], 2);
+    let started = lab.detail(&failed)["attempts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|attempt| attempt["assigned_at"].as_i64())
+        .max()
+        .unwrap();
+    let ended = lab.detail(&active)["run"]["finished_at"].as_i64().unwrap();
+    assert!(
+        started >= ended,
+        "the rerun started after the active run ended"
+    );
+}
+
+#[test]
 fn the_cron_starts_runs_and_pause_stops_it() {
     let lab = Lab::new("cron");
     let _master = lab.standalone(&[]);
@@ -601,6 +645,11 @@ impl Cluster {
     }
 
     fn worker(&self, name: &str, token: Option<&str>) -> Process {
+        self.worker_with(name, token, &[])
+    }
+
+    /// A worker that gets `flags` too.
+    fn worker_with(&self, name: &str, token: Option<&str>, flags: &[&str]) -> Process {
         let master = format!("--master=127.0.0.1:{}", self.lab.workers.get());
         let data = format!("--data_dir={name}");
         let name_flag = format!("--name={name}");
@@ -619,6 +668,7 @@ impl Cluster {
             format!("--token-file={}", file.display())
         });
         args.extend(token.as_deref());
+        args.extend(flags);
         self.lab.spawn(&format!("{name}.log"), &args)
     }
 
@@ -662,6 +712,52 @@ fn a_restart_of_the_master_reruns_nothing() {
         "the log survived the restart"
     );
     assert_eq!(lab.task(&run, "next")["state"], "success");
+}
+
+#[test]
+fn a_spool_over_its_limit_keeps_the_beginning_and_the_end() {
+    let (cluster, mut master) = Cluster::new("spool");
+    let lab = &cluster.lab;
+    let join = lab.cli(&["token", "worker"]);
+    let _w1 = cluster.worker_with("w1", Some(join.trim()), &["--log_spool_max=64KB"]);
+    lab.wait_for("w1 to join", || cluster.connected("w1"));
+
+    let go = lab.dir.join("go");
+    let flooded = lab.dir.join("flooded");
+    lab.apply(&format!(
+        "name: loud\ntasks:\n  flood:\n    run: [sh, -c, 'echo first; while [ ! -e {} ]; do sleep 0.1; done; seq 1 50000; echo last; touch {}']\n",
+        go.display(),
+        flooded.display()
+    ));
+    let run = lab.run("loud", &[]);
+    lab.wait_for("the first line at the master", || {
+        lab.try_cli(&["logs", &run, "flood"])
+            .is_ok_and(|log| log.contains("first"))
+    });
+
+    // About 1 MB of output while the master is away, 64 KB of spool.
+    master.kill();
+    std::fs::write(&go, "").unwrap();
+    // The shim writes `exit.json` once all the output is in the spool.
+    let exit = lab
+        .dir
+        .join("w1/attempts")
+        .join(&run)
+        .join("flood/1/exit.json");
+    lab.wait_for("the flood in the spool", || {
+        flooded.exists() && exit.exists()
+    });
+    let _master = Cluster::master(lab);
+    assert_eq!(lab.finished(&run), "success");
+    let log = lab.log(&run, "flood", 1);
+    let lines: Vec<&str> = log.lines().collect();
+    assert!(lines[0].ends_with("first"), "{}", lines[0]);
+    assert!(log.contains("middle part dropped"));
+    assert!(
+        lines.iter().any(|line| line.ends_with("last")),
+        "the end is kept"
+    );
+    assert!(lines.len() < 20_000, "{} lines kept", lines.len());
 }
 
 #[test]

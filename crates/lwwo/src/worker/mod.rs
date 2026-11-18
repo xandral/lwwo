@@ -12,6 +12,7 @@ mod cgroup;
 mod journal;
 pub(crate) mod shim;
 mod ship;
+mod spool;
 mod wake;
 mod watch;
 

@@ -41,6 +41,7 @@ CREATE TABLE dag_runs (
   started_at    INTEGER,
   finished_at   INTEGER,
   problem       TEXT,                               -- why lwwo stopped it, since version 2
+  rerun         TEXT,                               -- a rerun waiting for room, since version 3
   UNIQUE (id, dag_name)                             -- target of the key of task_runs
 ) STRICT;
 CREATE UNIQUE INDEX dag_runs_one_per_tick ON dag_runs(dag_name, logical_time) WHERE trigger <> 'manual';
@@ -94,7 +95,7 @@ CREATE TABLE tokens (
   revoked_at   INTEGER
 ) STRICT;
 
-PRAGMA user_version = 2;
+PRAGMA user_version = 3;
 ```
 
 ## Tables and columns
@@ -160,8 +161,9 @@ One row per run, created by the cron, by a catch-up or by `lwwo run`.
 | `logical_time` | integer | the instant of the run: the cron fire, or `--at` in manual runs. Tasks see it as `run.time` and `run.date` | `1792980000000` (Oct 26, 03:00) |
 | `trigger` | text | `cron`, `catchup` (a run started more than a minute late on its fire, because of an interruption or because it waited for the previous run) or `manual` | `cron` |
 | `params` | JSON text | the final values of the parameters, defaults included | `{"country": "IT", "threshold": 100}` |
-| `state` | text | `queued` (waiting because of the overlap rule), `running`, `success`, `failed` or `cancelled` | `running` |
+| `state` | text | `queued` (waiting because of the overlap rule, as a new run or as a rerun), `running`, `success`, `failed` or `cancelled` | `running` |
 | `problem` | text, optional | why `lwwo` stopped the run by itself: what it was told did not fit the state of the run. Almost always empty; cleared when the run is rerun | empty |
+| `rerun` | JSON text, optional | set only while a finished run waits to be rerun, with state `queued`: the tasks to run again (`task`, `all`, `only`), the `version` to use and the state the run had (`was`). Cleared when the rerun starts or is cancelled | `{"task":null,"all":false,"only":false,"version":"9f2c41…","was":"failed"}` |
 | `created_at` | integer | when the run was created | `1792980000000` (Oct 26, 03:00) |
 | `started_at` | integer, optional | when the run started, that is when its tasks were created; empty while it is queued | `1792980001000` (Oct 26, 03:00:01) |
 | `finished_at` | integer, optional | when the run ended or was cancelled | empty |
@@ -170,7 +172,7 @@ Two constraints: the same DAG cannot have two `cron` or `catchup` runs with the 
 
 ### `task_runs`: a task inside a run
 
-It is the bridge table between runs and tasks. The rows are all created together when the run starts, one per task; a queued run has none.
+It is the bridge table between runs and tasks. The rows are all created together when the run starts, one per task; a queued run has none, unless it is a finished run waiting to be rerun, which keeps its rows.
 
 | Column | Type | Meaning | Example |
 | --- | --- | --- | --- |
