@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## State of the repo
 
-Both crates exist and work end to end: `crates/lwwo-core` (decisions, no I/O) and `crates/lwwo` (the binary: master, worker, standalone, CLI, TUI). The design document `docs/design.md` is the source of truth for behaviour (the Italian spec it came from was deleted on 2026-11-15): read the relevant section before changing anything. `docs/configuration.md` lists every setting and `docs/database.md` the schema; a change in behaviour goes in these documents too. Check what actually exists (`git status`, `ls crates/`) before assuming.
+Both crates exist and work end to end: `crates/lwwo-core` (decisions, no I/O) and `crates/lwwo` (the binary: master, worker, standalone, CLI, TUI). The design document `docs/design.md` is the source of truth for behaviour: read the relevant section before changing anything. `docs/configuration.md` lists every setting and `docs/database.md` the schema; a change in behaviour goes in these documents too. Check what actually exists (`git status`, `ls crates/`) before assuming.
 
 Known gaps against the design are listed in `docs/status.md` under "Known limitations": raise them rather than silently filling them.
 
@@ -31,7 +31,7 @@ cargo run -p lwwo -- standalone              # try it: then `lwwo apply examples
 
 `cargo run -p lwwo -- tui --demo` shows the TUI without a master. Its tests (`tui/tests.rs`) press keys on an `App<Demo>` and look at the screen as text: use `tui.shows(&[…])` for anything in the message box, which types messages out one after another.
 
-When trying things by hand, never use the default ports or `pkill -f "lwwo standalone"`: the user may have their own standalone running on 7070 with data in `./lwwo-data`. Start trial masters with `--api-listen=127.0.0.1:<other port>` and a data dir under `/private/tmp`, and stop them by pid.
+When trying things by hand, never use the default ports or `pkill -f "lwwo standalone"`: a standalone may already be running on 7070 with data in `./lwwo-data`. Start trial masters with `--api-listen=127.0.0.1:<other port>` and a data dir under the system temp directory, and stop them by pid.
 
 The e2e tests start real `lwwo` processes under the system temp dir, with masters listening on port 0 and the tests reading the ports from the master's `master ready` log line (`Lab::learn_ports`): picking a "free" port by hand raced with parallel tests and with Docker Desktop; the cron test waits for the next minute, so the suite takes up to about a minute. `lwwo api GET /runs` prints raw JSON and is what the tests use to look inside.
 
@@ -40,8 +40,6 @@ The e2e tests start real `lwwo` processes under the system temp dir, with master
 ## Code style
 
 Aim for the style of well-maintained Rust libraries. Workspace lints in the root `Cargo.toml` (every crate has `[lints] workspace = true`): `unsafe_code` forbidden, `missing_docs` and `unreachable_pub` warned, `clippy::pedantic` warned. So every public item gets a doc comment, fallible public functions document `# Errors` and panicking ones `# Panics`, and getters are `#[must_use]`. Indices get newtypes (`TaskId(u32)` in `dag.rs`) so they cannot be mixed up. Error types are enums that implement `Display` and `std::error::Error` by hand (no `thiserror` in the core: it has no dependencies). Unit tests live in a `#[cfg(test)] mod tests` at the bottom of each file.
-
-The user is learning Rust. The `todo!("TASK n: …")` way of working (Claude scaffolds, the user fills in) is paused since 2026-11-10: Claude writes complete code, and the user reviews it afterwards. Explain Rust choices when asked.
 
 The binary uses `anyhow` for errors and `pub(crate)` everywhere (nothing in a binary is public API). `crates/lwwo/clippy.toml` lists the product names that need no backticks in docs.
 
@@ -61,7 +59,7 @@ The timerfd wake-up is Linux-only; macOS falls back to a once-a-minute check, so
 
 **Run engine = incremental Kahn.** Graph is rebuilt from the version's YAML when a run starts (not stored in the DB), kept in memory only while the DAG has open runs, shared by all runs of the same version, in CSR form (one successors vector + offsets). Per-run counters of missing deps; zero → single ready queue served round-robin across runs. Failure → successors become `skipped`. Re-runs reopen the *same* run with new attempts, using the run's DAG version.
 
-**Worker durability.** The worker never holds a task's process: it writes `spec.json`, starts `lwwo shim <dir>` in its own process group and only reads files after that (`started.json`, `log`, `exit.json`). A restarted worker scans `data_dir/attempts` and picks up what it finds; a directory is removed only on `Confirm`. Shim liveness is an `flock` on `shim.lock`, never a pid. A shim stops its task when the worker's `alive` file is older than the master's heartbeat timeout, so a task never runs on two workers.
+**Worker durability.** The worker never holds a task's process: it writes `spec.json`, starts `lwwo shim <dir>` in its own process group and only reads files after that (`started.json`, the `log.<offset>` spool segments, `exit.json`), woken by a kernel file watcher. A restarted worker scans `data_dir/attempts` and picks up what it finds; a directory is removed only on `Confirm`. Shim liveness is an `flock` on `shim.lock`, never a pid. A shim stops its task when the worker's `alive` file is older than the master's heartbeat timeout, so a dead worker's task does not keep running beside its replacement (a worker cut off from the network still does, until it is back: delivery is at least once).
 
 **Errors stop only what they are about.** The engine never panics on an event: a report or a queued task that does not fit a run's state emits `Command::Quarantine` (stored in `dag_runs.problem`, the run fails, its attempts are cancelled), a wrong shared count emits `Command::Anomaly` and is corrected. In the master, `contain()` keeps an error about one DAG or queued run from stopping the loop; only database errors (`is_storage`) stop it. Never catch a panic to go on. In `tests/sim.rs` a quarantine or anomaly is a failure.
 

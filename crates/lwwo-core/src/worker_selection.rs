@@ -382,8 +382,6 @@ mod tests {
         pool
     }
 
-    // Already working
-
     #[test]
     fn tasks_started_together_spread_over_unequal_workers() {
         let mut pool = pool(vec![(0, worker(2, 0, &[])), (1, worker(4, 0, &["big"]))]);
@@ -430,8 +428,6 @@ mod tests {
         );
     }
 
-    // TASK 11
-
     #[test]
     fn can_host_with_free_slots_and_labels() {
         let w = worker(4, 1, &["big", "docker"]);
@@ -456,8 +452,6 @@ mod tests {
         w.accepting = false;
         assert!(!w.can_host(1, &[]));
     }
-
-    // TASK 12
 
     #[test]
     fn load_compares_proportions() {
@@ -495,8 +489,6 @@ mod tests {
         let big = worker(u32::MAX, u32::MAX - 1, &[]);
         assert_eq!(compare_load(&big, &big, 1), Ordering::Equal);
     }
-
-    // TASK 13 (needs 11 and 12)
 
     #[test]
     fn selects_the_least_loaded_and_reserves_slots() {

@@ -137,16 +137,12 @@ mod tests {
         Timestamp::from_millis(millis)
     }
 
-    // Already working
-
     #[test]
     fn new_deadlines_are_empty() {
         let deadlines = Deadlines::new();
         assert!(deadlines.is_empty());
         assert_eq!(deadlines.next(), None);
     }
-
-    // TASK 21
 
     #[test]
     fn next_is_the_earliest() {
@@ -170,8 +166,6 @@ mod tests {
         assert_eq!(deadlines.next(), Some(t(200)));
     }
 
-    // TASK 22 (needs 21)
-
     #[test]
     fn remove_takes_the_deadline_away() {
         let mut deadlines = Deadlines::new();
@@ -190,8 +184,6 @@ mod tests {
         assert!(!deadlines.remove(W2));
         assert_eq!(deadlines.len(), 1);
     }
-
-    // TASK 23 (needs 21)
 
     #[test]
     fn pop_due_takes_everything_up_to_now_in_order() {

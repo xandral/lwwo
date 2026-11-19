@@ -308,8 +308,6 @@ mod tests {
         DateTime::new(date, hour, minute).expect("valid time in test")
     }
 
-    // Already working
-
     #[test]
     fn expressions_need_five_fields() {
         assert_eq!("0 3 * *".parse::<Cron>(), Err(CronError::FieldCount(4)));
@@ -325,8 +323,6 @@ mod tests {
         assert_eq!(first_at_or_after(quarters, 46), None);
         assert_eq!(first_at_or_after(quarters, 64), None);
     }
-
-    // TASK 17
 
     #[test]
     fn parses_stars_numbers_and_ranges() {
@@ -396,8 +392,6 @@ mod tests {
             );
         }
     }
-
-    // TASK 18 (needs 14 to 17)
 
     #[test]
     fn next_is_strictly_after() {

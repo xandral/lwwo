@@ -133,16 +133,12 @@ mod tests {
         std::iter::from_fn(|| queue.pop()).collect()
     }
 
-    // Already working
-
     #[test]
     fn new_queue_is_empty() {
         let queue = ReadyQueue::new();
         assert!(queue.is_empty());
         assert_eq!(queue.len(), 0);
     }
-
-    // TASK 8 and 9
 
     #[test]
     fn empty_queue_pops_nothing() {
@@ -205,8 +201,6 @@ mod tests {
         queue.pop();
         assert!(queue.is_empty());
     }
-
-    // TASK 10 (needs 8 and 9)
 
     #[test]
     fn remove_run_returns_its_tasks_and_keeps_the_others() {

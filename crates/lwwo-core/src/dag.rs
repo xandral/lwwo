@@ -427,8 +427,6 @@ mod tests {
         ]
     }
 
-    // TASK 1
-
     #[test]
     fn successors_of_example() {
         let g = Graph {
@@ -444,8 +442,6 @@ mod tests {
         assert!(g.successors(TaskId::new(3)).is_empty());
     }
 
-    // TASK 2
-
     #[test]
     fn in_degrees_of_example() {
         let p = preds(&[&[], &[0], &[0], &[1, 2]]);
@@ -456,8 +452,6 @@ mod tests {
     fn in_degrees_empty() {
         assert!(in_degrees(&[]).is_empty());
     }
-
-    // TASK 3
 
     #[test]
     fn csr_of_example() {
@@ -482,8 +476,6 @@ mod tests {
         assert_eq!(start, [0]);
         assert!(succ.is_empty());
     }
-
-    // TASK 4 (needs 1, 2 and 3 too)
 
     #[test]
     fn example_is_valid() {
@@ -524,7 +516,7 @@ mod tests {
         );
     }
 
-    // Already working: the checks that run before the graph is built.
+    // Checks that run before the graph is built
 
     #[test]
     fn duplicate_name_is_rejected() {

@@ -668,8 +668,6 @@ mod tests {
         ])
     }
 
-    // Already working
-
     #[test]
     fn new_run_is_all_blocked() {
         let run = diamond();
@@ -710,8 +708,6 @@ mod tests {
         assert_eq!(run.outcome(), Some(RunOutcome::Success));
     }
 
-    // TASK 5
-
     #[test]
     fn assign_ready_task() {
         let mut run = diamond();
@@ -744,8 +740,6 @@ mod tests {
             })
         );
     }
-
-    // TASK 6 (needs 5)
 
     #[test]
     fn success_releases_successors_in_order() {
@@ -795,8 +789,6 @@ mod tests {
         );
     }
 
-    // TASK 7 (needs 5 and 6)
-
     #[test]
     fn failure_skips_descendants_and_spares_other_branches() {
         let mut run = two_branches();
@@ -845,8 +837,6 @@ mod tests {
             })
         );
     }
-
-    // TASK 25 (needs 5 to 7)
 
     #[test]
     fn failure_with_retries_left_waits_to_retry() {

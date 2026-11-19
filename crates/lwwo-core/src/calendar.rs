@@ -202,8 +202,6 @@ mod tests {
         Date::new(year, month, day).expect("valid date in test")
     }
 
-    // Already working
-
     #[test]
     fn days_since_epoch_counts_from_1970() {
         assert_eq!(date(1970, 1, 1).days_since_epoch(), 0);
@@ -235,8 +233,6 @@ mod tests {
         assert!(DateTime::new(day, 0, 60).is_none());
     }
 
-    // TASK 14
-
     #[test]
     fn leap_years() {
         assert!(is_leap_year(2024));
@@ -244,8 +240,6 @@ mod tests {
         assert!(!is_leap_year(1900));
         assert!(is_leap_year(2000));
     }
-
-    // TASK 15 (needs 14)
 
     #[test]
     fn days_in_each_month() {
@@ -280,8 +274,6 @@ mod tests {
         assert_eq!(date(2026, 2, 28).next_day(), date(2026, 3, 1));
         assert_eq!(date(2026, 12, 31).next_day(), date(2027, 1, 1));
     }
-
-    // TASK 16
 
     #[test]
     fn weekdays_start_from_sunday() {

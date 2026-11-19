@@ -268,8 +268,6 @@ mod tests {
         schedule("0 * * * *", Utc, catchup, overlap)
     }
 
-    // Already working
-
     #[test]
     fn next_fire_in_utc() {
         let daily = schedule("0 3 * * *", Utc, false, Overlap::Queue);
@@ -327,8 +325,6 @@ mod tests {
         assert_eq!(daily.next_fire(first), Some(utc(2026, 10, 26, 1, 30)));
     }
 
-    // TASK 19
-
     #[test]
     fn latest_due_takes_the_last_fire_before_now() {
         let s = hourly(false, Overlap::Queue);
@@ -343,8 +339,6 @@ mod tests {
         );
         assert_eq!(s.latest_due(first, first), first);
     }
-
-    // TASK 20 (needs 19)
 
     #[test]
     fn a_fire_in_the_future_waits() {
